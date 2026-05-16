@@ -1,0 +1,35 @@
+# Echte Konfiguration mit Secrets (Kopie von env.example.py)
+src/env.py
+**/env.py
+
+# MicroPython Bytecode
+*.mpy
+
+# Lokale Diagnose-/Debug-Scripts
+_*.py
+_*.txt
+_*.mpy
+
+# Jekyll
+_site/
+.sass-cache/
+.jekyll-cache/
+.jekyll-metadata
+Gemfile.lock
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Backup-Dateien
+*.bak
+*.orig
+*~

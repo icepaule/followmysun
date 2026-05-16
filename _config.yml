@@ -1,0 +1,30 @@
+title: FollowMySun
+description: >-
+  Astronomisch geführte Sonnenstand-Nachführung für ein PV-Modul auf einem
+  Gartenhaus – ESP8266 + MPU-6050 + 12V-Aktuator, mit MQTT-Anbindung an
+  Home Assistant und Sturm-Notfallmodus.
+author: icepaule
+url: "https://icepaule.github.io"
+baseurl: "/followmysun"
+
+# Jekyll minimal theme (GitHub Pages built-in)
+theme: jekyll-theme-minimal
+
+# Sources
+markdown: kramdown
+kramdown:
+  syntax_highlighter: rouge
+  input: GFM
+
+# Default sidebar (links)
+show_downloads: true
+github:
+  repository_url: https://github.com/icepaule/followmysun
+
+# Exclude from build
+exclude:
+  - src/
+  - .gitignore
+  - README.md  # wir nutzen index.md fuer Pages
+  - Gemfile
+  - Gemfile.lock
