@@ -169,26 +169,19 @@ def _solar_position():
 
 
 def calculate_optimal_angle():
-    """Optimaler Panel-Neigungswinkel fuer Suedausrichtung:
-    Projektion des Sonnenvektors auf die N-S-Ebene.
-    tilt = atan(tan(zenith) * cos(azi - panel_azimuth))."""
+    """Panel-Neigung folgt der Sonnen-Elevation: tilt = 90 - elev.
+    Single-Axis Tracker mit Nord-Sued-Kippachse: Panel zeigt damit immer
+    moeglichst senkrecht zur aktuellen Sonnenhoehe. Auf MIN/MAX clamped."""
     try:
-        elev_deg, azi_deg = _solar_position()
+        elev_deg, _ = _solar_position()
         if elev_deg <= 0:
             return env.MIN_ANGLE
-        panel_azi = getattr(env, "PANEL_AZIMUTH", 180.0)
-        zenith = math.radians(90.0 - elev_deg)
-        azi_diff = math.radians(azi_deg - panel_azi)
-        cos_d = math.cos(azi_diff)
-        if cos_d <= 0:
-            print("Sonne hinter Panel (azi={:.1f}°): MIN_ANGLE".format(azi_deg))
-            return env.MIN_ANGLE
-        tilt_deg = math.degrees(math.atan(math.tan(zenith) * cos_d))
+        tilt_deg = 90.0 - elev_deg
         min_a = env.MIN_ANGLE
         max_a = getattr(env, "MAX_ANGLE", 70.0)
         result = max(min_a, min(max_a, tilt_deg))
-        print("Sonne: elev={:.1f}deg azi={:.1f}deg -> ideal={:.1f}deg -> Ziel={:.1f}deg".format(
-            elev_deg, azi_deg, tilt_deg, result))
+        print("Sonne: elev={:.1f}deg -> ideal={:.1f}deg -> Ziel={:.1f}deg".format(
+            elev_deg, tilt_deg, result))
         return round(result, 1)
     except Exception as e:
         print("Winkel-Berechnung Fehler:", e)
