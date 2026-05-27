@@ -55,15 +55,19 @@ motion_dir = 0            # Motor-Richtung: 0=Stopp, 1=Hoch, 2=Runter
 manual_override = False   # Manueller Modus aktiv (True/False)
 emergency_mode = False    # Notfall: Panel SOFORT auf MIN_ANGLE (Sturm-Schutz)
 
-# Zeitsteuerung
-sunset = 18               # Sonnenuntergang Stunde (lokale Zeit)
-sunrise = 6               # Sonnenaufgang Stunde (lokale Zeit)
+# Zeitsteuerung (nur noch Fallback bei Rechenfehler in is_night)
+sunset = 21               # Sonnenuntergang Stunde Fallback
+sunrise = 8               # Sonnenaufgang Stunde Fallback (= MORNING_START_HOUR)
+
+# Aktueller Lokal-Offset zur UTC in Stunden (1=MEZ, 2=MESZ) - wird in sync_time gesetzt
+tz_offset_hours = 2
 
 # MQTT-Status und Timing
 mqtt_connected = False    # MQTT-Verbindungsstatus
 last_mqtt_publish = 0     # Letzter MQTT-Publish Zeitstempel
 mqtt_publish_interval = 30000  # MQTT-Publish Intervall in ms (30 Sekunden)
 last_mqtt_connect_attempt = 0  # Letzter MQTT-Verbindungsversuch
+_boot_info_published = False  # tele/solar/BOOT nur einmal je Boot senden
 mqtt_reconnect_interval = 60000  # MQTT-Reconnect Intervall in ms (60 Sekunden)
 last_mqtt_ping = 0        # Letzter MQTT-Ping (Throttle - sonst 20x/s)
 mqtt_ping_interval = 30000     # MQTT-Ping nur alle 30 Sekunden
@@ -118,58 +122,95 @@ Bereich: {3:.1f}° – {7:.1f}°<br>
 # HILFSFUNKTIONEN
 # =============================================================================
 
+def _solar_elevation_at(offset_hours=0.0):
+    """Sonnen-Elevation (Grad) zu now + offset_hours. Fuer Sunset-Vorausschau."""
+    t = time.localtime()
+    doy = t[7]
+    local_hour = t[3] + t[4]/60.0 + t[5]/3600.0 + offset_hours
+    utc_hour = local_hour - tz_offset_hours
+    lat = math.radians(getattr(env, "LATITUDE", 48.066))
+    lon = getattr(env, "LONGITUDE", 11.667)
+    B = math.radians(360.0/365.0 * (doy - 81))
+    decl = math.radians(23.45) * math.sin(B)
+    eot_min = 9.87*math.sin(2*B) - 7.53*math.cos(B) - 1.5*math.sin(B)
+    solar_time = utc_hour + lon/15.0 + eot_min/60.0
+    H = math.radians((solar_time - 12.0) * 15.0)
+    sin_elev = math.sin(decl)*math.sin(lat) + math.cos(decl)*math.cos(lat)*math.cos(H)
+    sin_elev = max(-1.0, min(1.0, sin_elev))
+    return math.degrees(math.asin(sin_elev))
+
+def _solar_position():
+    """Aktuelle Sonnenposition (elevation, azimuth) in Grad.
+    Azimuth: 0=Nord, 90=Ost, 180=Sued, 270=West."""
+    t = time.localtime()
+    doy = t[7]
+    local_hour = t[3] + t[4]/60.0 + t[5]/3600.0
+    utc_hour = local_hour - tz_offset_hours
+    lat = math.radians(getattr(env, "LATITUDE", 48.066))
+    lon = getattr(env, "LONGITUDE", 11.667)
+    B = math.radians(360.0/365.0 * (doy - 81))
+    decl = math.radians(23.45) * math.sin(B)
+    eot_min = 9.87*math.sin(2*B) - 7.53*math.cos(B) - 1.5*math.sin(B)
+    solar_time = utc_hour + lon/15.0 + eot_min/60.0
+    H = math.radians((solar_time - 12.0) * 15.0)
+    sin_elev = math.sin(decl)*math.sin(lat) + math.cos(decl)*math.cos(lat)*math.cos(H)
+    sin_elev = max(-1.0, min(1.0, sin_elev))
+    elev = math.asin(sin_elev)
+    den = math.cos(elev)*math.cos(lat)
+    if abs(den) < 1e-9:
+        azi = math.pi
+    else:
+        cos_azi = (math.sin(decl) - math.sin(elev)*math.sin(lat)) / den
+        cos_azi = max(-1.0, min(1.0, cos_azi))
+        azi = math.acos(cos_azi)
+    if H > 0:
+        azi = 2*math.pi - azi
+    return math.degrees(elev), math.degrees(azi)
+
+
 def calculate_optimal_angle():
+    """Optimaler Panel-Neigungswinkel fuer Suedausrichtung:
+    Projektion des Sonnenvektors auf die N-S-Ebene.
+    tilt = atan(tan(zenith) * cos(azi - panel_azimuth))."""
     try:
-        t = time.localtime()
-        hour = t[3] + t[4]/60
-        day_of_year = t[7]
-        
-        # Sonnen-Deklination berechnen
-        decl = 23.45 * math.sin(math.radians(360/365 * (day_of_year - 81)))
-        
-        # Basis-Winkel für München (48.1351°N, 11.5820°E)
-        latitude = 48.1351
-        base = 90 - latitude
-        
-        # Zeitzonenkorrektur basierend auf Längengrad
-        longitude = 11.5820
-        timezone_correction = longitude / 15.0  # 15° pro Stunde
-        
-        # Zeitgleichung (Sonnenzeit vs. mittlere Zeit)
-        B = math.radians(360/365 * (day_of_year - 81))
-        equation_of_time = 9.87 * math.sin(2*B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)
-        
-        # Wahre Sonnenzeit berechnen
-        solar_time = hour + timezone_correction + equation_of_time/60
-        
-        # Saisonale Anpassung basierend auf Deklination
-        seasonal = decl * 0.5  # Sanftere Anpassung basierend auf Deklination
-        
-        # Stündliche Korrektur für optimale Ausrichtung
-        hour_correction = 0
-        if solar_time < 9:
-            hour_correction = -3  # Morgens etwas flacher
-        elif solar_time > 15:
-            hour_correction = -3  # Abends etwas flacher
-        elif 11 <= solar_time <= 13:
-            hour_correction = 2   # Mittags steiler für maximale Effizienz
-        
-        # Finaler Winkel
-        optimal_angle = base + decl + seasonal + hour_correction
-        
-        # Debug-Ausgabe
-        print(f"Astro-Berechnung: Deklination={decl:.1f}°, Basis={base:.1f}°, Solar-Zeit={solar_time:.1f}h")
-        
-        # Auf mechanische Endlagen des Aktuators clampen
+        elev_deg, azi_deg = _solar_position()
+        if elev_deg <= 0:
+            return env.MIN_ANGLE
+        panel_azi = getattr(env, "PANEL_AZIMUTH", 180.0)
+        zenith = math.radians(90.0 - elev_deg)
+        azi_diff = math.radians(azi_deg - panel_azi)
+        cos_d = math.cos(azi_diff)
+        if cos_d <= 0:
+            print("Sonne hinter Panel (azi={:.1f}°): MIN_ANGLE".format(azi_deg))
+            return env.MIN_ANGLE
+        tilt_deg = math.degrees(math.atan(math.tan(zenith) * cos_d))
+        min_a = env.MIN_ANGLE
         max_a = getattr(env, "MAX_ANGLE", 70.0)
-        return max(env.MIN_ANGLE, min(max_a, round(optimal_angle, 1)))
+        result = max(min_a, min(max_a, tilt_deg))
+        print("Sonne: elev={:.1f}deg azi={:.1f}deg -> ideal={:.1f}deg -> Ziel={:.1f}deg".format(
+            elev_deg, azi_deg, tilt_deg, result))
+        return round(result, 1)
     except Exception as e:
-        print(f"Winkel-Berechnung Fehler: {e}")
+        print("Winkel-Berechnung Fehler:", e)
         return env.MIN_ANGLE
 
 def is_night():
+    """Nacht-/Ruhephase fuer den Tracker.
+    - Vor MORNING_START_HOUR (Default 08:00 lokal) -> Nacht (Panel flach).
+    - Sonst pruefen, ob in SUNSET_MARGIN_HOURS (Default 1.0 h) die Sonne unter
+      dem Horizont steht. Wenn ja -> jetzt schon flach hinlegen.
+    - Fallback bei Rechenfehler: alte feste Stunden-Logik (sunrise/sunset)."""
     t = time.localtime()
-    return t[3] < sunrise or t[3] >= sunset
+    morning_start = int(getattr(env, "MORNING_START_HOUR", 8))
+    if t[3] < morning_start:
+        return True
+    try:
+        margin = float(getattr(env, "SUNSET_MARGIN_HOURS", 1.0))
+        if _solar_elevation_at(margin) <= 0.0:
+            return True
+        return False
+    except Exception:
+        return t[3] >= sunset
 
 def get_formatted_time():
     """Formatierte deutsche Zeit zurückgeben"""
@@ -259,6 +300,8 @@ def sync_time():
             
             # Zeitzone anwenden
             tz_offset = 7200 if is_dst else 3600  # MESZ: UTC+2, MEZ: UTC+1
+            global tz_offset_hours
+            tz_offset_hours = 2 if is_dst else 1
             local_timestamp = time.mktime(utc_time) + tz_offset
             local_time = time.localtime(local_timestamp)
             
@@ -302,12 +345,46 @@ def sync_time():
 # MQTT FUNKTIONEN
 # =============================================================================
 
+def load_calibration():
+    """Persistierten Offset aus /calib.json laden (ueberschreibt env-Defaults)."""
+    try:
+        with open("/calib.json", "r") as f:
+            d = ujson.loads(f.read())
+        if "SENSOR_OFFSET" in d:
+            env.SENSOR_OFFSET = float(d["SENSOR_OFFSET"])
+            print("Calib geladen: SENSOR_OFFSET =", env.SENSOR_OFFSET)
+        if "SENSOR_SIGN" in d:
+            env.SENSOR_SIGN = int(d["SENSOR_SIGN"])
+            print("Calib geladen: SENSOR_SIGN =", env.SENSOR_SIGN)
+    except OSError:
+        pass  # keine Calib-Datei -> env-Defaults aktiv
+    except Exception as e:
+        print("Calib-Load Fehler:", e)
+
+
+def save_calibration():
+    """Aktuellen Offset/Sign nach /calib.json persistieren."""
+    try:
+        d = {
+            "SENSOR_OFFSET": getattr(env, "SENSOR_OFFSET", 0.0),
+            "SENSOR_SIGN": getattr(env, "SENSOR_SIGN", 1),
+        }
+        with open("/calib.json", "w") as f:
+            f.write(ujson.dumps(d))
+        print("Calib gespeichert:", d)
+        return True
+    except Exception as e:
+        print("Calib-Save Fehler:", e)
+        return False
+
+
 def mqtt_on_message(topic, msg):
     """Callback fuer eingehende MQTT-Befehle (cmnd/solar/...)."""
-    global emergency_mode, target, manual_override, angle
+    global emergency_mode, target, manual_override, angle, current_angle
     try:
         t = topic.decode() if isinstance(topic, (bytes, bytearray)) else topic
-        m = (msg.decode() if isinstance(msg, (bytes, bytearray)) else msg).strip().lower()
+        m_raw = msg.decode() if isinstance(msg, (bytes, bytearray)) else msg
+        m = m_raw.strip().lower()
         print("MQTT cmd:", t, "=", m)
         if t.endswith("/EMERGENCY"):
             new = m in ("on", "1", "true", "yes")
@@ -323,11 +400,41 @@ def mqtt_on_message(topic, msg):
                     target = angle if not is_night() else env.MIN_ANGLE
                     print("EMERGENCY OFF - target={:.1f}".format(target))
                     mqtt_publish_debug("Emergency OFF")
-                # State sofort zurueckspiegeln
                 try:
                     mqtt.publish(f"{env.MQTT_TOPIC_SENSOR}/Emergency", "true" if new else "false")
                 except:
                     pass
+        elif t.endswith("/SETANGLE"):
+            # Live-Kalibrierung: User misst echten Winkel, schickt Wert -> wir
+            # rechnen den Offset so, dass PanelAngle dem entspricht. raw bleibt,
+            # nur env.SENSOR_OFFSET wird angepasst und persistiert.
+            try:
+                target_actual = float(m_raw.strip())
+            except Exception:
+                mqtt_publish_debug("SETANGLE: payload nicht numerisch")
+                return
+            if current_angle_raw is None:
+                mqtt_publish_debug("SETANGLE: noch kein MPU-Wert, ignoriert")
+                return
+            sign = getattr(env, "SENSOR_SIGN", 1) or 1
+            new_offset = current_angle_raw - (target_actual / sign)
+            env.SENSOR_OFFSET = new_offset
+            save_calibration()
+            current_angle = round(sign * (current_angle_raw - new_offset), 1)
+            print("Kalibrierung: SENSOR_OFFSET={:.2f} (raw={:.2f} -> {:.1f}deg)".format(
+                new_offset, current_angle_raw, target_actual))
+            mqtt_publish_debug("SETANGLE {:.1f}deg -> offset={:.2f}".format(target_actual, new_offset))
+            # Werte sofort frisch publizieren, sonst sieht HA 30s alte JSON
+            try:
+                mqtt_publish_sensor_data()
+            except:
+                pass
+        elif t.endswith("/RECALC"):
+            # Manueller Trigger: Sun-Position sofort neu rechnen
+            angle = calculate_optimal_angle()
+            if not emergency_mode and not is_night():
+                target = angle
+            mqtt_publish_debug("Recalc angle={:.1f}deg target={:.1f}deg".format(angle, target))
     except Exception as e:
         print("MQTT-Callback Fehler:", e)
 
@@ -357,15 +464,22 @@ def mqtt_connect():
 
         # Subscribe auf Command-Topics (retain-Messages kommen sofort)
         cmd_base = getattr(env, 'MQTT_TOPIC_CMD', 'cmnd/solar')
-        cmd_topic = cmd_base + "/EMERGENCY"
-        try:
-            mqtt.subscribe(cmd_topic)
-            print("Subscribed:", cmd_topic)
-        except Exception as e:
-            print("Subscribe-Fehler:", e)
+        for sub in ("/EMERGENCY", "/SETANGLE", "/RECALC"):
+            try:
+                mqtt.subscribe(cmd_base + sub)
+                print("Subscribed:", cmd_base + sub)
+            except Exception as e:
+                print("Subscribe-Fehler:", cmd_base + sub, e)
 
         # Status-Nachricht senden
         mqtt_publish_status("online", retain=True)
+
+        # Boot-Info einmalig retained publizieren (aus /_boot_info.txt von boot.py)
+        try:
+            _publish_boot_info_once()
+        except Exception as e:
+            print("Boot-Info-Publish Fehler:", e)
+
         return True
 
     except Exception as e:
@@ -373,6 +487,33 @@ def mqtt_connect():
         system_status['last_error'] = f"MQTT connect error: {str(e)}"
         print(f"MQTT-Verbindung fehlgeschlagen: {e}")
         return False
+
+def _publish_boot_info_once():
+    """Liest /_boot_info.txt (von boot.py geschrieben) und publiziert es
+    einmalig retained nach tele/solar/BOOT, damit HA den letzten Reset-Grund
+    auch dann sieht, wenn der ESP gerade offline ist."""
+    global _boot_info_published
+    if _boot_info_published or not mqtt_connected:
+        return
+    try:
+        with open("_boot_info.txt", "r") as f:
+            line = f.read().strip()
+    except OSError:
+        line = "rc=UNK code=-1 heap=0 t=0"
+    try:
+        t = time.localtime()
+        ts = "{:02d}.{:02d}.{:04d} {:02d}:{:02d}:{:02d}".format(
+            t[2], t[1], t[0], t[3], t[4], t[5])
+    except Exception:
+        ts = ""
+    dev = getattr(env, "MQTT_CLIENT_ID", "esp_solar")
+    payload = '{"Time":"' + ts + '","Boot":"' + line + '","Device":"' + dev + '"}'
+    try:
+        mqtt.publish("tele/solar/BOOT", payload, retain=True)
+        _boot_info_published = True
+        print("BOOT publiziert:", payload)
+    except Exception as e:
+        print("tele/solar/BOOT publish Fehler:", e)
 
 def mqtt_publish_sensor_data():
     """Sensordaten via MQTT veröffentlichen"""
@@ -871,6 +1012,9 @@ def init():
 
     print("Initialisierung...")
     gc.collect()
+
+    # Kalibrierung aus /calib.json laden (ueberschreibt env.SENSOR_OFFSET/_SIGN)
+    load_calibration()
 
     # Hardware Setup
     try:

@@ -54,6 +54,18 @@ SENSOR_SIGN   = 1
 MIN_ANGLE = 32.0       # Aktuator eingefahren = Dachneigung
 MAX_ANGLE = 58.7       # Aktuator voll ausgefahren = bitte einmessen
 
+# === Standort fuer Sonnenstand-Berechnung ===
+# Default-Werte sind Ottobrunn bei Muenchen - eigene Koordinaten eintragen.
+LATITUDE      = 48.066
+LONGITUDE     = 11.667
+PANEL_AZIMUTH = 180.0   # 0=N, 90=O, 180=S, 270=W (Sued = optimal Nordhalbkugel)
+
+# === Tracker Tagesfenster ===
+# Vor MORNING_START_HOUR liegt das Panel flach (MIN_ANGLE).
+# SUNSET_MARGIN_HOURS = wieviel Stunden vor Sonnenuntergang flach hinlegen.
+MORNING_START_HOUR  = 8
+SUNSET_MARGIN_HOURS = 1.0
+
 # === WebREPL (Remote-Code-Update ueber's WLAN) ===
 USE_WEBREPL      = True
 WEBREPL_PASSWORD = "dein_webrepl_passwort"   # 4-9 Zeichen
