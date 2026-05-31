@@ -822,7 +822,7 @@ def start_web():
 
 def loop():
     global current_angle, current_angle_raw, motion_dir, manual_override, angle, target
-    global last_mqtt_publish, system_status
+    global last_mqtt_publish, system_status, mqtt_connected
     
     last_sensor_read = 0
     last_angle_calc = 0
@@ -832,6 +832,8 @@ def loop():
     last_gc = 0
     last_sleep_check = 0
     last_keepalive = 0
+    last_wlan_check = 0
+    WLAN_CHECK_INTERVAL_MS = 30000   # alle 30s pruefen ob Assoziation noch steht
 
     # Regelungs-Konstanten
     SENSOR_INTERVAL_MS = 150        # MPU schnell pollen, damit Stop sofort greift
@@ -846,6 +848,34 @@ def loop():
 
             # Check for web requests (non-blocking check)
             handle_web_request()
+
+            # WLAN-Assoziation pruefen - wenn der AP wegfaellt,
+            # bleibt der ESP sonst stundenlang ohne Netzwerk-Stack erreichbar
+            # waehrend der Loop weiterlaeuft + WDT brav gefuettert wird.
+            # Vor MQTT-Check, damit ein MQTT-Reconnect nicht in tote Sockets rennt.
+            if time.ticks_diff(current_time, last_wlan_check) > WLAN_CHECK_INTERVAL_MS:
+                last_wlan_check = current_time
+                try:
+                    _wlan = network.WLAN(network.STA_IF)
+                    if not _wlan.isconnected():
+                        print("WLAN getrennt - reconnect zu", env.WIFI_SSID)
+                        mqtt_connected = False
+                        try:
+                            _wlan.disconnect()
+                        except Exception:
+                            pass
+                        try:
+                            _wlan.active(True)
+                            _wlan.connect(env.WIFI_SSID, env.WIFI_PASSWORD)
+                        except Exception as e:
+                            print("WLAN reconnect Fehler:", e)
+                        # Modem-Sleep nach Reconnect wieder hart auf NONE
+                        try:
+                            esp.sleep_type(esp.SLEEP_NONE)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print("WLAN-Check Fehler:", e)
 
             # MQTT-Verbindung prüfen
             mqtt_check_connection()
