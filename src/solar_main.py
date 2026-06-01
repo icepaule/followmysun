@@ -72,6 +72,12 @@ mqtt_reconnect_interval = 60000  # MQTT-Reconnect Intervall in ms (60 Sekunden)
 last_mqtt_ping = 0        # Letzter MQTT-Ping (Throttle - sonst 20x/s)
 mqtt_ping_interval = 30000     # MQTT-Ping nur alle 30 Sekunden
 
+# Stale-Watchdog: letzter erfolgreicher SENSOR-Publish ans Broker.
+# Wenn der Loop laeuft (WDT happy) aber 5 min kein Publish mehr durchgeht,
+# sind WLAN/MQTT/Heap tot - dann hilft nur noch ein harter Reboot.
+last_successful_publish_ticks = 0
+PUBLISH_STALE_MS = 300000      # 5 Minuten ohne erfolgreichen Publish -> machine.reset()
+
 # Netzwerk-Keepalive (UDP an Gateway): haelt WLAN-MAC aktiv,
 # pflegt ARP-Cache der anderen Hosts im Subnet.
 udp_keepalive = None      # UDP-Socket fuer Outbound-Keepalive
@@ -510,7 +516,7 @@ def _publish_boot_info_once():
 
 def mqtt_publish_sensor_data():
     """Sensordaten via MQTT veröffentlichen"""
-    global system_status
+    global system_status, last_successful_publish_ticks
     if not mqtt_connected:
         return False
     
@@ -580,8 +586,9 @@ def mqtt_publish_sensor_data():
         mqtt.publish(f"{base}/Emergency",     "true" if emergency_mode else "false")
 
         print(f"MQTT-Daten gesendet: Panel={current_angle:.1f}°, Ziel={target:.1f}°, Sonne={angle:.1f}°")
+        last_successful_publish_ticks = time.ticks_ms()
         return True
-        
+
     except Exception as e:
         print(f"MQTT-Publish Fehler: {e}")
         system_status['last_error'] = f"MQTT publish error: {str(e)}"
@@ -822,7 +829,7 @@ def start_web():
 
 def loop():
     global current_angle, current_angle_raw, motion_dir, manual_override, angle, target
-    global last_mqtt_publish, system_status, mqtt_connected
+    global last_mqtt_publish, system_status, mqtt_connected, last_successful_publish_ticks
     
     last_sensor_read = 0
     last_angle_calc = 0
@@ -876,6 +883,25 @@ def loop():
                             pass
                 except Exception as e:
                     print("WLAN-Check Fehler:", e)
+
+            # Stale-Watchdog: wenn der Loop laeuft, aber 5 min lang kein MQTT-Publish
+            # mehr durchgegangen ist, sind WLAN/MQTT/Heap so kaputt, dass nur ein
+            # harter Reboot hilft. Greift wenn WLAN-Reconnect + mqtt_check_connection
+            # alleine die Verbindung nicht mehr zurueckholen koennen (z.B. OOM).
+            if last_successful_publish_ticks != 0 and time.ticks_diff(current_time, last_successful_publish_ticks) > PUBLISH_STALE_MS:
+                stale_ms = time.ticks_diff(current_time, last_successful_publish_ticks)
+                print("Stale-Watchdog: kein Publish seit %d ms - machine.reset()" % stale_ms)
+                try:
+                    with open("_reset_info.txt", "w") as _f:
+                        _f.write("stale-publish %dms heap=%d\n" % (stale_ms, gc.mem_free()))
+                except Exception:
+                    pass
+                try:
+                    rel1.off(); rel2.off()
+                except Exception:
+                    pass
+                time.sleep(1)  # Log/Relay-Aus durchlassen
+                machine.reset()
 
             # MQTT-Verbindung prüfen
             mqtt_check_connection()
@@ -1032,9 +1058,13 @@ def loop():
 def init():
     global sensor, rel1, rel2, angle, target, wdt
     global udp_keepalive, udp_keepalive_gw
+    global last_successful_publish_ticks
 
     print("Initialisierung...")
     gc.collect()
+    # Stale-Watchdog: Grace-Window startet ab init(). 5 Minuten ohne
+    # ersten Publish nach Boot -> Reboot.
+    last_successful_publish_ticks = time.ticks_ms()
 
     # Kalibrierung aus /calib.json laden (ueberschreibt env.SENSOR_OFFSET/_SIGN)
     load_calibration()
