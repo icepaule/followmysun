@@ -78,6 +78,22 @@ mqtt_ping_interval = 30000     # MQTT-Ping nur alle 30 Sekunden
 last_successful_publish_ticks = 0
 PUBLISH_STALE_MS = 300000      # 5 Minuten ohne erfolgreichen Publish -> machine.reset()
 
+# Self-Echo-Watchdog: ESP publisht alle 60s einen Token auf tele/solar/PING_ECHO
+# und subscribed sich selbst auf den Topic. Der Broker liefert die eigene
+# Message zurueck -> wir wissen sicher, dass publish + receive funktionieren.
+# Faengt den 'silent publish' Fall ab (TCP CLOSE_WAIT, WLAN-Modem stuck), den
+# der reine Stale-Watchdog nicht sieht (umqtt.simple publish QoS=0 = fire-and-forget).
+last_ping_sent_token = 0       # 0 = noch nie / Echo schon zurueckgekommen
+last_ping_sent_ticks = 0
+last_echo_seen_ticks = 0       # Zeitpunkt letzter beliebiger empfangener Echo (Heartbeat)
+ECHO_INTERVAL_MS = 60000       # PING alle 60s
+ECHO_TIMEOUT_MS = 120000       # 2 min ohne Echo-Roundtrip -> machine.reset()
+
+# Periodischer Hard-Reboot: alle 6h sicherer Reset, um Memory-Fragmentation und
+# stille Driver-Stalls (die selbst Layer 1+2 ueberleben koennten) zu killen.
+boot_ticks = 0
+SCHEDULED_REBOOT_MS = 21600000  # 6 * 3600 * 1000 = 6h
+
 # Netzwerk-Keepalive (UDP an Gateway): haelt WLAN-MAC aktiv,
 # pflegt ARP-Cache der anderen Hosts im Subnet.
 udp_keepalive = None      # UDP-Socket fuer Outbound-Keepalive
@@ -378,11 +394,22 @@ def save_calibration():
 
 
 def mqtt_on_message(topic, msg):
-    """Callback fuer eingehende MQTT-Befehle (cmnd/solar/...)."""
+    """Callback fuer eingehende MQTT-Befehle (cmnd/solar/...) und Self-Echo."""
     global emergency_mode, target, manual_override, angle, current_angle
+    global last_ping_sent_token, last_echo_seen_ticks
     try:
         t = topic.decode() if isinstance(topic, (bytes, bytearray)) else topic
         m_raw = msg.decode() if isinstance(msg, (bytes, bytearray)) else msg
+        # Echo-Topic ist hot-path (alle 60s) - nicht spammig loggen
+        if t.endswith("/PING_ECHO"):
+            last_echo_seen_ticks = time.ticks_ms()
+            # Wenn empfangener Token == zuletzt gesendeter, ist Roundtrip bestaetigt
+            try:
+                if int(m_raw) == last_ping_sent_token:
+                    last_ping_sent_token = 0  # consumed
+            except Exception:
+                pass
+            return
         m = m_raw.strip().lower()
         print("MQTT cmd:", t, "=", m)
         if t.endswith("/EMERGENCY"):
@@ -469,6 +496,16 @@ def mqtt_connect():
                 print("Subscribed:", cmd_base + sub)
             except Exception as e:
                 print("Subscribe-Fehler:", cmd_base + sub, e)
+
+        # Self-Echo-Watchdog: auf eigenen PING_ECHO-Topic subscriben.
+        # Broker liefert eigene publishes zurueck -> wir sehen sicher dass
+        # publish + receive WIRKLICH durch's Netz gegangen sind (nicht nur
+        # ein QoS=0 fire-and-forget das stillschweigend verloren ging).
+        try:
+            mqtt.subscribe(b"tele/solar/PING_ECHO")
+            print("Subscribed: tele/solar/PING_ECHO (Self-Echo-Watchdog)")
+        except Exception as e:
+            print("Subscribe-Fehler PING_ECHO:", e)
 
         # Status-Nachricht senden
         mqtt_publish_status("online", retain=True)
@@ -566,32 +603,26 @@ def mqtt_publish_sensor_data():
             }
         }
 
-        # JSON-Payload senden
+        # Nur EIN JSON-Payload publishen (HA holt sich Werte per value_template).
+        # Frueher: 1 JSON + 11 Einzeltopics = 12 publish/Cycle = ~12kB Heap-Burn.
+        # Heute: 1 publish, GC vor und nach dumps fuer minimale Heap-Spitze.
+        gc.collect()
         payload = ujson.dumps(sensor_data)
+        sensor_data = None  # Referenz freigeben vor publish
         mqtt.publish(env.MQTT_TOPIC_SENSOR, payload)
+        payload = None
+        gc.collect()
 
-        # Einzelne Topics fuer Home-Assistant-Sensoren (HA mag das lieber als JSON-Pfade)
-        base = env.MQTT_TOPIC_SENSOR
-        max_a = getattr(env, "MAX_ANGLE", 70.0)
-        mqtt.publish(f"{base}/PanelAngle",    str(round(current_angle, 1)) if current_angle is not None else "null")
-        mqtt.publish(f"{base}/PanelAngleRaw", str(round(current_angle_raw, 1)) if current_angle_raw is not None else "null")
-        mqtt.publish(f"{base}/TargetAngle",   str(round(target, 1)))
-        mqtt.publish(f"{base}/SunAngle",      str(round(angle, 1)))
-        mqtt.publish(f"{base}/Motion",        str(motion_dir))
-        mqtt.publish(f"{base}/MotionText",    ["Stopp", "Hoch", "Runter"][motion_dir])
-        mqtt.publish(f"{base}/Manual",        "true" if manual_override else "false")
-        mqtt.publish(f"{base}/MinAngle",      str(round(env.MIN_ANGLE, 1)))
-        mqtt.publish(f"{base}/MaxAngle",      str(round(max_a, 1)))
-        mqtt.publish(f"{base}/IsNight",       "true" if is_night() else "false")
-        mqtt.publish(f"{base}/Emergency",     "true" if emergency_mode else "false")
-
-        print(f"MQTT-Daten gesendet: Panel={current_angle:.1f}°, Ziel={target:.1f}°, Sonne={angle:.1f}°")
+        # %-format statt f-string: spart String-Allocations im hot path
+        print("MQTT-Daten gesendet: Panel=%.1f Ziel=%.1f Sonne=%.1f Heap=%d" %
+              (current_angle if current_angle is not None else -999.0,
+               target, angle, gc.mem_free()))
         last_successful_publish_ticks = time.ticks_ms()
         return True
 
     except Exception as e:
-        print(f"MQTT-Publish Fehler: {e}")
-        system_status['last_error'] = f"MQTT publish error: {str(e)}"
+        print("MQTT-Publish Fehler:", e)
+        system_status['last_error'] = "MQTT publish error: " + str(e)
         return False
 
 def mqtt_publish_status(status, retain=False):
@@ -830,7 +861,8 @@ def start_web():
 def loop():
     global current_angle, current_angle_raw, motion_dir, manual_override, angle, target
     global last_mqtt_publish, system_status, mqtt_connected, last_successful_publish_ticks
-    
+    global last_ping_sent_token, last_ping_sent_ticks, last_echo_seen_ticks
+
     last_sensor_read = 0
     last_angle_calc = 0
     last_time_sync = 0
@@ -901,6 +933,56 @@ def loop():
                 except Exception:
                     pass
                 time.sleep(1)  # Log/Relay-Aus durchlassen
+                machine.reset()
+
+            # Self-Echo-Watchdog (L2): faengt den 'silent publish' Fall ab den
+            # der reine Stale-Watchdog nicht sieht (QoS=0 publish() returnt success
+            # auch bei TCP CLOSE_WAIT / WLAN-Modem-Stuck).
+            # Loesung: ESP publisht alle 60s einen Token, broker liefert ihn an
+            # uns selbst zurueck via Subscribe. 120s kein Echo -> machine.reset().
+            if mqtt_connected:
+                if time.ticks_diff(current_time, last_ping_sent_ticks) > ECHO_INTERVAL_MS:
+                    try:
+                        last_ping_sent_token = current_time & 0x3FFFFFFF or 1  # nie 0
+                        mqtt.publish(b"tele/solar/PING_ECHO", str(last_ping_sent_token).encode())
+                        last_ping_sent_ticks = current_time
+                        # Grace bei erstem Ping: last_echo_seen_ticks auf jetzt setzen
+                        if last_echo_seen_ticks == 0:
+                            last_echo_seen_ticks = current_time
+                    except Exception as e:
+                        print("Echo-Publish Fehler:", e)
+                # Timeout-Check (nur wenn schon mal gepingt wurde)
+                if last_echo_seen_ticks != 0 and time.ticks_diff(current_time, last_echo_seen_ticks) > ECHO_TIMEOUT_MS:
+                    elapsed = time.ticks_diff(current_time, last_echo_seen_ticks)
+                    print("Echo-Watchdog: %d ms ohne Roundtrip - machine.reset()" % elapsed)
+                    try:
+                        with open("_reset_info.txt", "w") as _f:
+                            _f.write("echo-timeout %dms heap=%d\n" % (elapsed, gc.mem_free()))
+                    except Exception:
+                        pass
+                    try:
+                        rel1.off(); rel2.off()
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                    machine.reset()
+
+            # Periodischer Hard-Reboot (L3): alle 6h sicheres Reset, killt
+            # akkumulierte Memory-Fragmentation und stille Driver-Stalls
+            # die selbst L1+L2 ueberleben koennten. Pragmatisch & garantiert.
+            if boot_ticks != 0 and time.ticks_diff(current_time, boot_ticks) > SCHEDULED_REBOOT_MS:
+                uptime_ms = time.ticks_diff(current_time, boot_ticks)
+                print("Scheduled-Reboot: %d ms uptime erreicht - machine.reset()" % uptime_ms)
+                try:
+                    with open("_reset_info.txt", "w") as _f:
+                        _f.write("scheduled-6h %dms heap=%d\n" % (uptime_ms, gc.mem_free()))
+                except Exception:
+                    pass
+                try:
+                    rel1.off(); rel2.off()
+                except Exception:
+                    pass
+                time.sleep(1)
                 machine.reset()
 
             # MQTT-Verbindung prüfen
@@ -1058,13 +1140,15 @@ def loop():
 def init():
     global sensor, rel1, rel2, angle, target, wdt
     global udp_keepalive, udp_keepalive_gw
-    global last_successful_publish_ticks
+    global last_successful_publish_ticks, boot_ticks
 
     print("Initialisierung...")
     gc.collect()
     # Stale-Watchdog: Grace-Window startet ab init(). 5 Minuten ohne
     # ersten Publish nach Boot -> Reboot.
     last_successful_publish_ticks = time.ticks_ms()
+    # Scheduled-Reboot (L3): boot_ticks markiert Boot-Zeitpunkt fuer 6h-Timer.
+    boot_ticks = time.ticks_ms()
 
     # Kalibrierung aus /calib.json laden (ueberschreibt env.SENSOR_OFFSET/_SIGN)
     load_calibration()
