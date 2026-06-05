@@ -1,19 +1,18 @@
-# ESP32 Solar Panel Controller mit MPU-6050, MQTT, NTP und Webinterface
+# ESP8266 Solar Panel Controller mit MPU-6050, MQTT, NTP
 #
 # Hardware:
 # - MPU-6050 (GY-521) Gyro/Accel Sensor zur Winkelmessung
 # - 2x Relays zur Motorsteuerung (Hoch/Runter)
-# - ESP32 mit WLAN-Verbindung
+# - ESP8266 mit WLAN-Verbindung
 #
 # Funktionen:
-# - Automatische Sonnenwinkel-Berechnung basierend auf Astronomie
-# - NTP-Zeitaktualisierung mit präziser deutscher Zeitzone (MEZ/MESZ)
-# - MQTT-Übertragung aller Sensordaten und Status
-# - Webinterface zur manuellen Steuerung und Überwachung
-# - WebREPL für Fernwartung
+# - Automatische Sonnenwinkel-Berechnung (Azimut-aware Optimum, S-Tilt)
+# - NTP-Zeitaktualisierung mit deutscher Zeitzone (MEZ/MESZ)
+# - MQTT-Telemetrie + Commands (Manual, MinAngle, Emergency, SetAngle, Recalc)
+# - WebREPL fuer Fernwartung
 #
-# Autor: Solar Controller v2.1
-# Datum: 24.05.2025
+# Steuerung komplett ueber MQTT (cmnd/solar/...), kein Webserver mehr
+# (war zu heap-hungrig auf ESP8266 -> WLAN-Drops bei Iframe-Last).
 
 import machine
 import time
@@ -42,7 +41,6 @@ sensor = None               # MPU-6050 Gyroskop/Accel-Sensor-Objekt
 rel1 = None                # Relay 1 (Motor Runter)
 rel2 = None                # Relay 2 (Motor Hoch)
 mqtt = None                # MQTT-Client-Objekt
-srv = None                 # Webserver-Socket-Objekt
 wdt = None                 # Hardware-Watchdog (None bis init() erfolgreich war)
 
 # Sensor- und Steuerungsdaten
@@ -109,37 +107,6 @@ system_status = {
     'ntp_sync_count': 0   # Anzahl erfolgreicher NTP-Synchronisationen
 }
 
-# HTML Template
-html_template = """<!DOCTYPE html>
-<html><head>
-<meta http-equiv='refresh' content='5'>
-<meta charset='UTF-8'>
-<style>
-body {{ background:#fff; font-family:sans-serif; padding:10px; }}
-b {{ font-size:16px; }}
-small {{ color:#666; }}
-.emerg {{ background:#c00; color:#fff; padding:6px; margin-bottom:8px; font-weight:bold; }}
-input,button {{ padding:4px; margin:2px; font-size:14px; }}
-form {{ margin:8px 0; }}
-</style></head><body>
-{8}
-<b>Solarpanel</b><br>
-Aktuell: {0}° <small>(roh: {6})</small><br>
-Ziel: {1:.1f}°<br>
-Motor: {2}<br>
-Bereich: {3:.1f}° – {7:.1f}°<br>
-<form method='POST'>
-<input name='minangle' type='number' step='0.1' value='{4:.1f}'>
-<input name='save' type='submit' value='Min setzen'>
-<input name='reset' type='submit' value='Reset'>
-</form>
-<form method='POST'>
-<button name='manual' value='down'>⬇️</button>
-<button name='manual' value='up'>⬆️</button>
-<button name='manual' value='auto'>🔁</button>
-</form><small>Zeit: {5}</small>
-</body></html>"""
-
 # =============================================================================
 # HILFSFUNKTIONEN
 # =============================================================================
@@ -191,19 +158,30 @@ def _solar_position():
 
 
 def calculate_optimal_angle():
-    """Panel-Neigung folgt der Sonnen-Elevation: tilt = 90 - elev.
-    Single-Axis Tracker mit Nord-Sued-Kippachse: Panel zeigt damit immer
-    moeglichst senkrecht zur aktuellen Sonnenhoehe. Auf MIN/MAX clamped."""
+    """Azimut-aware Optimum-Tilt fuer Panel mit Sued-Kippung (E-W-Achse).
+    Formel: t = atan2(-cos(az)*cos(elev), sin(elev))
+    - az=180deg (Sued, Mittag): t = 90 - elev (frueheres Verhalten, exakt gleich)
+    - az<>180: optimaler Tilt projiziert die Sonne auf die N-S-Kippebene.
+      Morgen/Abend (Sonne stark E/W) -> flacher Tilt, weil Steil-Kippung
+      auf Sued-Achse keinen Beitrag mehr bringt -> mehr Ertrag aus Cosinus.
+    Auf MIN/MAX clamped. Bei Sonne unter Horizont: MIN_ANGLE."""
     try:
-        elev_deg, _ = _solar_position()
+        elev_deg, az_deg = _solar_position()
         if elev_deg <= 0:
             return env.MIN_ANGLE
-        tilt_deg = 90.0 - elev_deg
+        elev_r = math.radians(elev_deg)
+        az_r = math.radians(az_deg)
+        # Optimaler Tilt fuer Sued-tiltendes Panel (E-W Rotationsachse).
+        # Negative Werte -> noerdlicher Tilt; bei uns nie erwuenscht -> auf 0 clampen.
+        tilt_r = math.atan2(-math.cos(az_r) * math.cos(elev_r), math.sin(elev_r))
+        tilt_deg = math.degrees(tilt_r)
+        if tilt_deg < 0:
+            tilt_deg = 0.0
         min_a = env.MIN_ANGLE
         max_a = getattr(env, "MAX_ANGLE", 70.0)
         result = max(min_a, min(max_a, tilt_deg))
-        print("Sonne: elev={:.1f}deg -> ideal={:.1f}deg -> Ziel={:.1f}deg".format(
-            elev_deg, tilt_deg, result))
+        print("Sonne: elev={:.1f}deg az={:.1f}deg -> opt={:.1f}deg -> Ziel={:.1f}deg".format(
+            elev_deg, az_deg, tilt_deg, result))
         return round(result, 1)
     except Exception as e:
         print("Winkel-Berechnung Fehler:", e)
@@ -395,7 +373,7 @@ def save_calibration():
 
 def mqtt_on_message(topic, msg):
     """Callback fuer eingehende MQTT-Befehle (cmnd/solar/...) und Self-Echo."""
-    global emergency_mode, target, manual_override, angle, current_angle
+    global emergency_mode, target, manual_override, angle, current_angle, motion_dir
     global last_ping_sent_token, last_echo_seen_ticks
     try:
         t = topic.decode() if isinstance(topic, (bytes, bytearray)) else topic
@@ -461,6 +439,40 @@ def mqtt_on_message(topic, msg):
             if not emergency_mode and not is_night():
                 target = angle
             mqtt_publish_debug("Recalc angle={:.1f}deg target={:.1f}deg".format(angle, target))
+        elif t.endswith("/MANUAL"):
+            # Manuelle Motor-Steuerung (ersetzt die alten Web-Buttons)
+            # Payload: up|down|auto. Emergency hat weiter Vorrang.
+            if emergency_mode:
+                mqtt_publish_debug("Manual ignored: emergency active")
+                return
+            if m == "up":
+                manual_override = True
+                rel1.off(); rel2.on()
+                motion_dir = 1
+                mqtt_publish_debug("Manual: Up")
+            elif m == "down":
+                manual_override = True
+                rel1.on(); rel2.off()
+                motion_dir = 2
+                mqtt_publish_debug("Manual: Down")
+            elif m == "auto":
+                manual_override = False
+                rel1.off(); rel2.off()
+                motion_dir = 0
+                mqtt_publish_debug("Auto mode")
+            else:
+                mqtt_publish_debug("Manual: unknown payload " + m_raw[:16])
+        elif t.endswith("/MIN_ANGLE"):
+            # Min-Angle setzen (clamp 0..70). Ersatz fuer Web-Form.
+            try:
+                v = float(m_raw.strip())
+                env.MIN_ANGLE = max(0.0, min(70.0, v))
+                mqtt_publish_debug("MIN_ANGLE={:.1f}".format(env.MIN_ANGLE))
+                # Wenn Emergency/Nacht aktiv, target sofort nachziehen
+                if emergency_mode or is_night():
+                    target = env.MIN_ANGLE
+            except Exception:
+                mqtt_publish_debug("MIN_ANGLE: payload nicht numerisch")
     except Exception as e:
         print("MQTT-Callback Fehler:", e)
 
@@ -490,7 +502,7 @@ def mqtt_connect():
 
         # Subscribe auf Command-Topics (retain-Messages kommen sofort)
         cmd_base = getattr(env, 'MQTT_TOPIC_CMD', 'cmnd/solar')
-        for sub in ("/EMERGENCY", "/SETANGLE", "/RECALC"):
+        for sub in ("/EMERGENCY", "/SETANGLE", "/RECALC", "/MANUAL", "/MIN_ANGLE"):
             try:
                 mqtt.subscribe(cmd_base + sub)
                 print("Subscribed:", cmd_base + sub)
@@ -700,161 +712,6 @@ def mqtt_check_connection():
             mqtt_connected = False
 
 # =============================================================================
-# WEBSERVER-FUNKTIONEN
-# =============================================================================
-
-def handle_web_request():
-    global manual_override, motion_dir
-    try:
-        # Check if connection is available (non-blocking)
-        conn, addr = srv.accept()
-        print("Client verbunden:", addr)
-
-        # WDT vor potenziell blockierender Operation fuettern - sonst kann
-        # Web-Request + UDP + Sensor zusammen ueber die 3s WDT-Frist gehen.
-        if wdt is not None:
-            wdt.feed()
-
-        # Set connection to blocking mode for reliable data transfer.
-        # 0.5s recv-Timeout: Browser sendet das Request in <100ms.
-        # Laenger waere nur "zaeher Client" - der darf gerne den WDT triggern.
-        conn.setblocking(True)
-        conn.settimeout(0.5)
-        
-        try:
-            # Receive request with timeout
-            request = conn.recv(1024)
-            if not request:
-                return
-            
-            # MicroPython compatible decode
-            try:
-                req_str = request.decode('utf-8')
-            except:
-                req_str = str(request)
-            
-            print("Request empfangen")
-            
-            # Handle POST requests
-            if "POST" in req_str:
-                if "minangle=" in req_str:
-                    try:
-                        # Find value between minangle= and next & or space
-                        start = req_str.find("minangle=") + 9
-                        end = req_str.find("&", start)
-                        if end == -1:
-                            end = req_str.find(" ", start)
-                        if end == -1:
-                            end = len(req_str)
-                        v = req_str[start:end]
-                        env.MIN_ANGLE = max(0, min(70, float(v)))
-                        print("Min-Angle gesetzt auf:", env.MIN_ANGLE)
-                    except Exception as e:
-                        print("Angle parse error:", e)
-                        
-                elif "reset" in req_str:
-                    env.MIN_ANGLE = 32.0
-                    print("Reset auf 32°")
-                    
-                elif "manual=" in req_str:
-                    try:
-                        start = req_str.find("manual=") + 7
-                        end = req_str.find("&", start)
-                        if end == -1:
-                            end = req_str.find(" ", start)
-                        if end == -1:
-                            end = len(req_str)
-                        m = req_str[start:end]
-                        
-                        if m == "up":
-                            manual_override = True
-                            rel1.off()
-                            rel2.on()
-                            motion_dir = 1
-                            print("Manuell: Hoch")
-                            mqtt_publish_debug("Manual: Up")
-                        elif m == "down":
-                            manual_override = True
-                            rel1.on()
-                            rel2.off()
-                            motion_dir = 2
-                            print("Manuell: Runter")
-                            mqtt_publish_debug("Manual: Down")
-                        elif m == "auto":
-                            manual_override = False
-                            rel1.off()
-                            rel2.off()
-                            motion_dir = 0
-                            print("Auto-Modus")
-                            mqtt_publish_debug("Auto mode")
-                    except Exception as e:
-                        print("Manual parse error:", e)
-            
-            # Prepare response
-            angle_text = "Fehler" if current_angle is None else "{:.1f}°".format(current_angle)
-            raw_text   = "--" if current_angle_raw is None else "{:.1f}°".format(current_angle_raw)
-            motion_text = ["Stopp", "Hoch", "Runter"][motion_dir]
-            current_time = get_formatted_time()
-            max_angle = getattr(env, "MAX_ANGLE", 70.0)
-
-            emerg_banner = "<div class='emerg'>NOTFALL aktiv - Panel flach auf MIN_ANGLE</div>" if emergency_mode else ""
-            response_body = html_template.format(
-                angle_text, target, motion_text, env.MIN_ANGLE, env.MIN_ANGLE,
-                current_time, raw_text, max_angle, emerg_banner
-            )
-            
-            # Send complete HTTP response
-            response = "HTTP/1.1 200 OK\r\n"
-            response += "Content-Type: text/html; charset=UTF-8\r\n"
-            response += "Content-Length: {}\r\n".format(len(response_body))
-            response += "Connection: close\r\n"
-            response += "\r\n"
-            response += response_body
-            
-            # MicroPython compatible send mit send-Loop (single send() kann
-            # bei >1KB truncieren, dann sieht der Client einen IncompleteRead).
-            data = response.encode('utf-8')
-            sent = 0
-            while sent < len(data):
-                n = conn.send(data[sent:])
-                if not n:
-                    break
-                sent += n
-            print("Response gesendet ({} bytes)".format(sent))
-            
-        except OSError as e:
-            if e.args[0] != 11:  # Ignore EAGAIN
-                print("Request handling error:", e)
-        except Exception as e:
-            print("Request handling error:", e)
-        finally:
-            try:
-                conn.close()
-            except:
-                pass
-                
-    except OSError as e:
-        # EAGAIN (11) means no connection available - this is normal
-        if e.args[0] != 11:
-            print("Connection error:", e)
-    except Exception as e:
-        print("Unexpected error:", e)
-
-def start_web():
-    global srv
-    try:
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(('0.0.0.0', 80))
-        srv.listen(2)  # Erhöhte Queue
-        srv.setblocking(False)
-        print("Webserver läuft auf Port 80")
-        return True
-    except Exception as e:
-        print("Webserver Start-Fehler:", e)
-        return False
-
-# =============================================================================
 # HAUPTFUNKTIONEN
 # =============================================================================
 
@@ -884,9 +741,6 @@ def loop():
     while True:
         try:
             current_time = time.ticks_ms()
-
-            # Check for web requests (non-blocking check)
-            handle_web_request()
 
             # WLAN-Assoziation pruefen - wenn der AP wegfaellt,
             # bleibt der ESP sonst stundenlang ohne Netzwerk-Stack erreichbar
@@ -1247,11 +1101,7 @@ def init():
     
     # MQTT-Verbindung aufbauen
     mqtt_connect()
-    
-    # Webserver starten
-    if not start_web():
-        return False
-    
+
     # Initial calculations (Emergency-Flag wird ggf. gleich danach vom
     # ersten check_msg gesetzt - retained-Message vom Broker)
     angle = calculate_optimal_angle()
