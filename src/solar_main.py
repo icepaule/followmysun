@@ -496,8 +496,20 @@ def mqtt_connect():
             keepalive=60
         )
         mqtt.set_callback(mqtt_on_message)
+        # MQTT-LWT: Broker schreibt "Offline" retain auf tele/solar/LWT, sobald
+        # die TCP/keepalive-Verbindung wegbricht (haengender ESP, WLAN-Drop).
+        # MUSS vor connect() gesetzt werden.
+        try:
+            mqtt.set_last_will(b"tele/solar/LWT", b"Offline", retain=True, qos=0)
+        except Exception as e:
+            print("LWT-Setup Fehler:", e)
         mqtt.connect()
         mqtt_connected = True
+        # Online-Marker (retained) - ueberschreibt das LWT-"Offline" beim Reconnect.
+        try:
+            mqtt.publish(b"tele/solar/LWT", b"Online", retain=True)
+        except Exception as e:
+            print("LWT-Online-Publish Fehler:", e)
         print(f"MQTT verbunden mit {env.MQTT_SERVER}:{env.MQTT_PORT}")
 
         # Subscribe auf Command-Topics (retain-Messages kommen sofort)
