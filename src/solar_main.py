@@ -189,21 +189,24 @@ def calculate_optimal_angle():
 
 def is_night():
     """Nacht-/Ruhephase fuer den Tracker.
-    - Vor MORNING_START_HOUR (Default 08:00 lokal) -> Nacht (Panel flach).
-    - Sonst pruefen, ob in SUNSET_MARGIN_HOURS (Default 1.0 h) die Sonne unter
+    - Morgens: Nacht, solange die Sonne noch nicht ueber dem Horizont steht -
+      echte astronomische Berechnung statt festem MORNING_START_HOUR-Cutoff
+      (der ignorierte den echten Sonnenaufgang und war inkonsistent zur
+      bereits astronomisch berechneten Abendseite).
+    - Abends: pruefen, ob in SUNSET_MARGIN_HOURS (Default 1.0 h) die Sonne unter
       dem Horizont steht. Wenn ja -> jetzt schon flach hinlegen.
     - Fallback bei Rechenfehler: alte feste Stunden-Logik (sunrise/sunset)."""
     t = time.localtime()
     morning_start = int(getattr(env, "MORNING_START_HOUR", 8))
-    if t[3] < morning_start:
-        return True
     try:
+        if _solar_elevation_at(0.0) <= 0.0:
+            return True
         margin = float(getattr(env, "SUNSET_MARGIN_HOURS", 1.0))
         if _solar_elevation_at(margin) <= 0.0:
             return True
         return False
     except Exception:
-        return t[3] >= sunset
+        return t[3] < morning_start or t[3] >= sunset
 
 def get_formatted_time():
     """Formatierte deutsche Zeit zurückgeben"""
@@ -222,10 +225,11 @@ def sync_time():
         import ntptime
         print("Synchronisiere Zeit via NTP...")
         
-        # Deutsche NTP-Server verwenden
+        # NTP-Server: GW zuerst (VLAN12 blockt externes UDP/123), externe als Fallback
         ntp_servers = [
+            "10.10.12.1",
             "pool.ntp.org",
-            "de.pool.ntp.org", 
+            "de.pool.ntp.org",
             "time.google.com",
             "ptbtime1.ptb.de"
         ]
@@ -754,7 +758,7 @@ def loop():
         try:
             current_time = time.ticks_ms()
 
-            # WLAN-Assoziation pruefen - wenn der AP wegfaellt,
+            # WLAN-Assoziation pruefen - wenn Bad!Net/AP wegfaellt,
             # bleibt der ESP sonst stundenlang ohne Netzwerk-Stack erreichbar
             # waehrend der Loop weiterlaeuft + WDT brav gefuettert wird.
             # Vor MQTT-Check, damit ein MQTT-Reconnect nicht in tote Sockets rennt.
