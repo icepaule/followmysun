@@ -22,6 +22,7 @@ layout: default
 - [Sensor-Kalibrierung](docs/calibration.html)
 - [Software-Architektur](docs/software.html)
 - [Hardware-Migration ESP12F → Olimex ESP32-EVB-EA](docs/hardware-migration-esp32-evb.html) — Umbau für WLAN-schwache Standorte, externe Antenne, korrekter 12 V-Split
+- [Wiring-Übersicht ESP32-EVB](docs/wiring-esp32-evb.html) — alle vier Schaltbilder auf einer Seite, als Werkbank-Referenz
 - [Source-Code auf GitHub](https://github.com/icepaule/followmysun)
 
 ## Was macht das System?

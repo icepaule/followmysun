@@ -9,6 +9,8 @@ Diese Doku beschreibt den Umbau des Solar-Tracker-Controllers vom ESP8266-basier
 externer WLAN-Antenne. Ziel: mehr RAM, robusteres WLAN am schlechten Empfangsort
 (Schuppen), OTA-Fähigkeit.
 
+> → Alle vier Schaltbilder kompakt auf einer Seite: [Wiring-Übersicht ESP32-EVB](wiring-esp32-evb.html)
+
 > **TL;DR** — Ihr könnt das alte Board 1:1 tauschen, müsst aber die **12 V-Zuleitung
 > umkonzepieren**: das neue Board ist strikt 5 V. Nötig sind zusätzlich ein
 > Mini-360 Step-Down und eine WAGO-T-Verzweigung.
