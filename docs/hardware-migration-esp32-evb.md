@@ -188,14 +188,84 @@ Zur ESP8266→ESP32-Portierung sind minimale Code-Anpassungen nötig:
 - **PowerSave**: `sta.config(pm=sta.PM_NONE)` in `boot.py` (statt `esp.sleep_type(esp.SLEEP_NONE)`).
 - **Compat-Shim** in `solar_main.py` für `esp.sleep_type()` (no-op auf ESP32).
 - Kein `.mpy`-Compile mehr nötig; `solar_main.py` läuft direkt.
+- **`init()`-Reihenfolge umgedreht**: WLAN zuerst → MQTT → MPU (optional) → HTTP → WDT. Damit bleibt der Remote-Zugang auch dann garantiert, wenn der MPU-6050 (noch) nicht am UEXT hängt. `sensor = None` sperrt automatisch jegliche Motorbewegung (Sicherheit), Web + MQTT laufen normal weiter und melden `MpuOk:false` inkl. Fehlercode.
+- **Watchdog-Timeout: 30 s** (statt fest 3 s wie beim ESP8266) — genug Reserve, damit ein langsamer HTTP-Request keinen falschen Reset auslöst.
 
 Siehe [software.md](software.md) für die generellen Firmware-Details.
+
+## Eingebautes WebGUI + REST-API
+
+Ausreichend RAM auf dem ESP32 (~80 kB frei im Betrieb) macht es möglich, den früher gestrichenen Mini-Webserver wieder mitlaufen zu lassen — nonblocking im Main-Loop, ohne Threads. Aufrufbar direkt unter `http://<esp-ip>/`:
+
+- **Dashboard** (Auto-Refresh alle 4 s): Panel-Winkel, Ziel-Winkel, Sonnen-Winkel, Motorstatus, Emergency/Manual-Flags, WLAN-RSSI, Heap, Uptime, MPU-Status, ggf. LastError.
+- **Motor manuell**: Buttons **Hoch / Runter / Auto**.
+- **Notfall**: **EMERGENCY ON / OFF** (Panel sofort flach) + **Recalc** (Sonne neu berechnen).
+- **Kalibrierung / Grenzen**: Feld für `SetAngle <grad>` (kalibriert den MPU-Offset live und persistiert ihn nach `/calib.json`) + Feld für `MIN_ANGLE` (0–70°).
+
+Alle Aktionen laufen intern über dieselben Helper wie die MQTT-Commands (`action_set_emergency`, `action_manual`, `action_setangle`, `action_recalc`, `action_set_minangle`) — die REST-Endpoints sind ein reiner Alias-Pfad neben dem MQTT-Bus.
+
+### REST-Endpoints
+
+| Methode | Pfad | Payload (form-encoded) | Antwort |
+|---|---|---|---|
+| `GET` | `/` | — | HTML-Dashboard |
+| `GET` | `/api/state` | — | JSON-Snapshot (identisches Schema wie MQTT-Topic `tele/solar/SENSOR`) |
+| `POST` | `/api/manual` | `v=up\|down\|auto` | text/plain, z.B. `Manual: Up` |
+| `POST` | `/api/emergency` | `v=on\|off` | `Emergency on` / `Emergency off` |
+| `POST` | `/api/recalc` | — | `recalc: sun=X target=Y` |
+| `POST` | `/api/setangle` | `v=<grad>` | `calib: offset=Z, panel=<grad>` |
+| `POST` | `/api/minangle` | `v=<grad>` | `MIN_ANGLE=<grad>` |
+
+Beispiel mit `curl`:
+
+```bash
+curl http://10.10.12.55/api/state | jq
+curl -X POST -d "v=on"  http://10.10.12.55/api/emergency
+curl -X POST -d "v=45"  http://10.10.12.55/api/setangle
+```
+
+## Reverse-Proxy für Zugriff aus getrenntem VLAN
+
+Wenn der Tracker in einem isolierten IoT-VLAN sitzt (z.B. Firewall-Regel „nur MQTT + Internet raus"), erreicht euer Client-Netz den Web-Port `:80` nicht direkt. Ein kleiner nginx-Container auf einem Host im Zwischennetz (z.B. der HA-Server) proxied durch:
+
+```nginx
+# /etc/nginx/conf.d/pv-tracker.conf
+server {
+  listen 8055;
+  location / {
+    proxy_pass http://10.10.12.55;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_read_timeout 8s;
+  }
+}
+```
+
+als Docker One-Liner:
+
+```bash
+docker run -d --name pv-tracker-proxy --restart unless-stopped \
+  -p 8055:80 \
+  -v /opt/pv-tracker-proxy/nginx.conf:/etc/nginx/nginx.conf:ro \
+  nginx:alpine
+```
+
+Danach ist das Dashboard unter `http://<HA-server-IP>:8055/` aus dem regulären LAN erreichbar und kann per **Home Assistant `panel_iframe`** direkt eingebettet werden.
+
+## IP-Reservierung für den Olimex
+
+Der Olimex meldet sich mit einer eigenen MAC-Adresse (bei uns `38:18:2b:e5:70:8c`), also bekommt er eine **neue DHCP-Lease** und nicht die alte ESP12F-IP. Zwei Möglichkeiten:
+
+1. **Neue Reservation** — im DHCP-Server / UniFi-Controller die neue MAC auf die gewünschte feste IP pinnen und die alte ESP12F-Reservation komplett löschen.
+2. **Aktuelle DHCP-Lease pinnen** — falls die neue IP OK ist, einfach `use_fixedip=true` mit dem aktuellen Wert setzen, damit sie nicht wandert.
+
+Alle bestehenden HA-/Node-RED-Integrationen bleiben unberührt, weil MQTT-Client-ID (`esp_solar`) und alle Topics gleich bleiben — der IP-Wechsel betrifft nur das WebGUI-Bookmark und den Reverse-Proxy.
 
 ## Live gefunden beim Werkbank-Bootstrap (2026-07-20)
 
 - **Serial-Port nicht erraten, sondern per USB-IDs identifizieren:** `/dev/ttyUSB0`/`/dev/ttyUSB1` sind keine stabile Zuordnung, wenn mehrere USB-Seriell-Geräte am selben Host hängen (hier: ein Zigbee-Dongle auf `ttyUSB0`, das Olimex-Board erst auf `ttyUSB1`). Vorher gegenprüfen: `udevadm info -q property -n /dev/ttyUSBx` — das Olimex-Board meldet sich als CH340-Serial-Konverter (`ID_VENDOR_ID=1a86`, `ID_MODEL_ID=7523`).
 - **`mpremote exec`/WebREPL-Diagnosebefehle unterbrechen ein bereits laufendes `main.py`** (wirkt wie Ctrl-C auf die REPL) — für reines Mitlesen ohne Eingriff stattdessen den seriellen Port passiv auslesen (z.B. `pyserial` ohne zu senden), sonst kommt der Tracker nie über die WLAN-Verbindung hinaus, weil jeder Diagnose-Check ihn erneut unterbricht.
 - **`02-setup-wifi-webrepl.sh` verbindet WLAN nur einmalig innerhalb der eigenen Skript-Session** (schreibt lediglich `webrepl_cfg.py`) — ohne bereits deploytes `boot.py`/`main.py` verbindet sich das Board nach einem Reset noch nicht automatisch. Fürs allererste Deployment daher `mpremote connect port:<port> fs cp <datei> :<datei>` (seriell, kein WLAN nötig) statt `03-deploy.sh` (WebREPL, braucht bereits WLAN).
-- **`init()` bricht kontrolliert vor dem WLAN-Connect ab, wenn kein MPU-6050 am I2C-Bus antwortet** (`ENODEV`) — Absicht (kein blindes Verfahren des Aktuators ohne Winkelsensor), aber auf der reinen Werkbank ohne UEXT-Sensor bleibt WLAN/MQTT dadurch aus. Für einen Bootstrap-Test ohne Sensor ist das also kein Fehler, sondern erwartetes Verhalten.
+- ~~**`init()` bricht kontrolliert vor dem WLAN-Connect ab, wenn kein MPU-6050 am I2C-Bus antwortet** (`ENODEV`) — Absicht (kein blindes Verfahren des Aktuators ohne Winkelsensor), aber auf der reinen Werkbank ohne UEXT-Sensor bleibt WLAN/MQTT dadurch aus. Für einen Bootstrap-Test ohne Sensor ist das also kein Fehler, sondern erwartetes Verhalten.~~ **Behoben 2026-07-24**: `init()` startet jetzt zuerst WLAN + MQTT + WebGUI, MPU ist optional. Bei fehlendem Sensor bleibt lediglich der Motor gesperrt (`sensor is None` verhindert jede Relais-Aktion), Remote-Zugang und Diagnose laufen aber weiter — genau so, wie man es für den Bootstrap braucht.
 - **Speicher-Bestätigung:** frischer Boot zeigt ~151 KB freien Heap (ESP32) gegenüber ~29 KB beim ESP8266 zum Vergleich — bestätigt, dass `solar_main.py` auf dieser Generation wie vorgesehen direkt als Rohquelltext läuft, kein `.mpy`-Precompile nötig.
 - ⚠️ **Parallelbetrieb-Falle:** Solange der alte ESP8266-Tracker noch produktiv im Feld läuft, darf ein Werkbank-Test des neuen ESP32 **nicht** dieselbe `MQTT_CLIENT_ID` ("esp_solar") nutzen — der Broker trennt sonst die ältere (echte) Verbindung. Zusätzlich sind `tele/solar/LWT`, `tele/solar/PING_ECHO` und `tele/solar/BOOT` in `solar_main.py` **hart codiert** (nicht über `env.py`-Variablen geführt wie `MQTT_TOPIC_SENSOR`/`_DEBUG`/`_CMD`) — für einen isolierten Werkbank-Test müssen diese drei Topic-Strings temporär mit umbenannt werden (z.B. `tele/solar_bench/...`), sonst überschreibt der Testaufbau den retained LWT-Status des echten Trackers in Home Assistant. TODO: diese drei Topics ebenfalls über `env.py` konfigurierbar machen, um das für künftige Parallel-Tests nicht mehr manuell patchen zu müssen.
