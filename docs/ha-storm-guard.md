@@ -39,6 +39,28 @@ flowchart LR
 
 **Wichtige Design-Entscheidung – HTTP statt MQTT-Command:** Der `cmnd/solar/EMERGENCY`-MQTT-Sub wird auf dem Olimex zeitweise unzuverlässig (nach MQTT-Reconnects gehen Subscriptions manchmal verloren). Das direkt über HTTP an den `/api/emergency`-Endpoint zu schicken ist zuverlässiger und braucht keine dauerhafte Subscription am Board.
 
+## Olimex WebGUI (unverändert)
+
+Der Tracker selbst zeigt seinen Live-Zustand weiterhin unter `http://<nuc-ha-ip>:8055/`:
+
+![Olimex WebGUI – Live Dashboard mit Panel/Ziel/Motor/Emergency-Status](img/ha-storm-guard/01-olimex-webgui.jpg)
+
+Wenn Storm Guard triggert → HA POST an `/api/emergency` → `Emergency` wechselt auf `an`, Target auf MinAngle. Der Reboot-Button rechts unten stammt aus der `/api/reboot`-Ergänzung (commit 65ecf99).
+
+## HA Helpers-Übersicht
+
+Alle 6 Storm-Guard-Helper unter **Settings → Devices & Services → Helpers**:
+
+![HA Helpers gefiltert auf pv_storm – 4 Input-Numbers + 2 Input-Booleans](img/ha-storm-guard/02-ha-helpers.jpg)
+
+## HA Automations-Übersicht
+
+Die 3 Storm-Guard-Automations unter **Settings → Automations**:
+
+![HA Automations gefiltert auf 'storm guard' – Aktivieren, Deaktivierung, Release, alle ON](img/ha-storm-guard/03-ha-automations.jpg)
+
+„Last triggered: Never" bedeutet: der aktuelle Wind (~2 km/h zum Screenshot-Zeitpunkt) hat noch nie den Trigger-Schwellwert erreicht — Storm Guard ist scharf aber schlafend.
+
 ## Konfigurierbare Parameter
 
 Alle in HA-UI editierbar unter **Einstellungen → Geräte & Dienste → Helfer**:
