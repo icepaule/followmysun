@@ -48,6 +48,7 @@ rel2 = None
 mqtt = None
 wdt = None
 http_sock = None
+reboot_pending_at_ms = 0
 
 current_angle = None
 current_angle_raw = None
@@ -605,6 +606,9 @@ Panel steht auf <input id="sa" type="number" step="0.1" value="45"> Grad
 MIN_ANGLE <input id="ma" type="number" step="0.1" value="32"> Grad
 <button onclick="cmd('/api/minangle',document.getElementById('ma').value)">Setzen</button>
 </section>
+<section><h2>System</h2>
+<button class="danger" onclick="if(confirm('Board wirklich neu starten?'))cmd('/api/reboot','')">Reboot</button>
+</section>
 <div id="log" style="font-size:.75em;color:#666"></div>
 <div class="foot">Auto-Refresh 4s / <a href="javascript:pull()">Refresh</a></div>
 <script>
@@ -680,12 +684,47 @@ def _parse_form(body):
             out[k] = v
     return out
 
+def _sd_check():
+    """Mount SD, statvfs + kleiner write/read Roundtrip. Return dict."""
+    r = {'mounted': False, 'error': None, 'info': {}}
+    try:
+        sd = machine.SDCard(slot=1, width=1)
+        try:
+            uos.mount(sd, '/sd')
+        except OSError as e:
+            # 17 = EEXIST (bereits gemountet) OK
+            if e.args and e.args[0] != 17:
+                raise
+        r['mounted'] = True
+        st = uos.statvfs('/sd')
+        r['info']['block_size'] = st[1]
+        r['info']['blocks_total'] = st[2]
+        r['info']['blocks_free'] = st[3]
+        r['info']['bytes_total'] = st[1] * st[2]
+        r['info']['bytes_free'] = st[1] * st[3]
+        payload = "ping %d\n" % time.ticks_ms()
+        with open('/sd/_ping.txt', 'w') as f:
+            f.write(payload)
+        with open('/sd/_ping.txt', 'r') as f:
+            back = f.read()
+        r['info']['write_read_ok'] = (back == payload)
+        try:
+            r['info']['ls_root'] = uos.listdir('/sd')[:30]
+        except Exception:
+            r['info']['ls_root'] = []
+    except Exception as e:
+        r['error'] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
 def _http_handle_request(method, path, headers, body):
     """Return (code, ctype, body_str)."""
     if method == 'GET' and (path == '/' or path == '/index.html'):
         return 200, 'text/html; charset=utf-8', HTML_PAGE
     if method == 'GET' and path == '/api/state':
         return 200, 'application/json', ujson.dumps(_get_state_snapshot())
+    if method == 'GET' and path == '/api/sdcheck':
+        return 200, 'application/json', ujson.dumps(_sd_check())
     if method == 'POST' and path.startswith('/api/'):
         form = _parse_form(body) if body else {}
         v = form.get('v', '')
@@ -709,6 +748,10 @@ def _http_handle_request(method, path, headers, body):
             return 200, 'text/plain', action_setangle(v)
         if path == '/api/minangle':
             return 200, 'text/plain', action_set_minangle(v)
+        if path == '/api/reboot':
+            global reboot_pending_at_ms
+            reboot_pending_at_ms = time.ticks_add(time.ticks_ms(), 1500)
+            return 200, 'text/plain', 'reboot in 1500ms'
     return 404, 'text/plain', 'not found'
 
 def _http_poll():
@@ -798,6 +841,13 @@ def loop():
     while True:
         try:
             now = time.ticks_ms()
+
+            # Fern-Reboot via /api/reboot
+            if reboot_pending_at_ms and time.ticks_diff(now, reboot_pending_at_ms) >= 0:
+                print("reboot_pending -> machine.reset()")
+                try: rel1.off(); rel2.off()
+                except: pass
+                time.sleep_ms(100); machine.reset()
 
             # WLAN-Assoziation pruefen
             if time.ticks_diff(now, last_wlan_check) > WLAN_CHECK_INTERVAL_MS:
