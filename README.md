@@ -118,6 +118,7 @@ followmysun/
 │   ├── installation.md
 │   ├── mqtt.md
 │   ├── calibration.md
+│   ├── tracker-debugging.md  # aktuelle Quellbasis und Debug-Checkliste
 │   └── img/                   # Fotos vom realen Aufbau
 └── _config.yml                # Jekyll Konfiguration (GitHub Pages)
 ```
