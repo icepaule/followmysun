@@ -1,18 +1,19 @@
-# ESP8266 Solar Panel Controller mit MPU-6050, MQTT, NTP
+# ESP32 Solar Panel Controller mit MPU-6050, MQTT, NTP und Webinterface
 #
 # Hardware:
 # - MPU-6050 (GY-521) Gyro/Accel Sensor zur Winkelmessung
 # - 2x Relays zur Motorsteuerung (Hoch/Runter)
-# - ESP8266 mit WLAN-Verbindung
+# - ESP32 mit WLAN-Verbindung
 #
 # Funktionen:
-# - Automatische Sonnenwinkel-Berechnung (Azimut-aware Optimum, S-Tilt)
-# - NTP-Zeitaktualisierung mit deutscher Zeitzone (MEZ/MESZ)
-# - MQTT-Telemetrie + Commands (Manual, MinAngle, Emergency, SetAngle, Recalc)
-# - WebREPL fuer Fernwartung
+# - Automatische Sonnenwinkel-Berechnung basierend auf Astronomie
+# - NTP-Zeitaktualisierung mit präziser deutscher Zeitzone (MEZ/MESZ)
+# - MQTT-Übertragung aller Sensordaten und Status
+# - Webinterface zur manuellen Steuerung und Überwachung
+# - WebREPL für Fernwartung
 #
-# Steuerung komplett ueber MQTT (cmnd/solar/...), kein Webserver mehr
-# (war zu heap-hungrig auf ESP8266 -> WLAN-Drops bei Iframe-Last).
+# Autor: Solar Controller v2.1
+# Datum: 24.05.2025
 
 import machine
 import time
@@ -41,6 +42,7 @@ sensor = None               # MPU-6050 Gyroskop/Accel-Sensor-Objekt
 rel1 = None                # Relay 1 (Motor Runter)
 rel2 = None                # Relay 2 (Motor Hoch)
 mqtt = None                # MQTT-Client-Objekt
+srv = None                 # Webserver-Socket-Objekt
 wdt = None                 # Hardware-Watchdog (None bis init() erfolgreich war)
 
 # Sensor- und Steuerungsdaten
@@ -53,49 +55,59 @@ motion_dir = 0            # Motor-Richtung: 0=Stopp, 1=Hoch, 2=Runter
 manual_override = False   # Manueller Modus aktiv (True/False)
 emergency_mode = False    # Notfall: Panel SOFORT auf MIN_ANGLE (Sturm-Schutz)
 
-# Zeitsteuerung (nur noch Fallback bei Rechenfehler in is_night)
-sunset = 21               # Sonnenuntergang Stunde Fallback
-sunrise = 8               # Sonnenaufgang Stunde Fallback (= MORNING_START_HOUR)
+# Zeitsteuerung
+sunset = 18               # Sonnenuntergang Stunde (lokale Zeit, grobes Fallback)
+sunrise = 6               # Sonnenaufgang Stunde (lokale Zeit, grobes Fallback)
 
-# Aktueller Lokal-Offset zur UTC in Stunden (1=MEZ, 2=MESZ) - wird in sync_time gesetzt
-tz_offset_hours = 2
+# Tracking-Aktiv-Fenster: Panel-Nachfuehrung laeuft nur zwischen TRACK_START_H
+# und (echter Sonnenuntergang - TRACK_END_BEFORE_SUNSET_H). Davor und danach
+# bleibt das Panel flach auf MIN_ANGLE liegen (Stromertrag in Randzeiten
+# rechtfertigt die Verfahrwege nicht und reduziert Verschleiss/Risiko).
+TRACK_START_H = 8.0
+TRACK_END_BEFORE_SUNSET_H = 1.0
 
 # MQTT-Status und Timing
 mqtt_connected = False    # MQTT-Verbindungsstatus
 last_mqtt_publish = 0     # Letzter MQTT-Publish Zeitstempel
 mqtt_publish_interval = 30000  # MQTT-Publish Intervall in ms (30 Sekunden)
 last_mqtt_connect_attempt = 0  # Letzter MQTT-Verbindungsversuch
-_boot_info_published = False  # tele/solar/BOOT nur einmal je Boot senden
 mqtt_reconnect_interval = 60000  # MQTT-Reconnect Intervall in ms (60 Sekunden)
 last_mqtt_ping = 0        # Letzter MQTT-Ping (Throttle - sonst 20x/s)
 mqtt_ping_interval = 30000     # MQTT-Ping nur alle 30 Sekunden
 
-# Stale-Watchdog: letzter erfolgreicher SENSOR-Publish ans Broker.
-# Wenn der Loop laeuft (WDT happy) aber 5 min kein Publish mehr durchgeht,
-# sind WLAN/MQTT/Heap tot - dann hilft nur noch ein harter Reboot.
-last_successful_publish_ticks = 0
-PUBLISH_STALE_MS = 300000      # 5 Minuten ohne erfolgreichen Publish -> machine.reset()
-
-# Self-Echo-Watchdog: ESP publisht alle 60s einen Token auf tele/solar/PING_ECHO
-# und subscribed sich selbst auf den Topic. Der Broker liefert die eigene
-# Message zurueck -> wir wissen sicher, dass publish + receive funktionieren.
-# Faengt den 'silent publish' Fall ab (TCP CLOSE_WAIT, WLAN-Modem stuck), den
-# der reine Stale-Watchdog nicht sieht (umqtt.simple publish QoS=0 = fire-and-forget).
-last_ping_sent_token = 0       # 0 = noch nie / Echo schon zurueckgekommen
-last_ping_sent_ticks = 0
-last_echo_seen_ticks = 0       # Zeitpunkt letzter beliebiger empfangener Echo (Heartbeat)
-ECHO_INTERVAL_MS = 60000       # PING alle 60s
-ECHO_TIMEOUT_MS = 120000       # 2 min ohne Echo-Roundtrip -> machine.reset()
-
-# Periodischer Hard-Reboot: alle 6h sicherer Reset, um Memory-Fragmentation und
-# stille Driver-Stalls (die selbst Layer 1+2 ueberleben koennten) zu killen.
-boot_ticks = 0
-SCHEDULED_REBOOT_MS = 21600000  # 6 * 3600 * 1000 = 6h
+# MQTT-Socket-Timeout in Sekunden. umqtt.simple legt den Socket OHNE Timeout
+# an -> ein publish()/ping() auf eine tote bzw. halb-offene TCP-Verbindung
+# blockiert dann *unendlich* in socket.send(). Fatal: waehrend eines
+# blockierenden Syscalls fuettert das SDK beide Watchdogs (HW + Soft) weiter,
+# es kommt also KEIN Reset - das Geraet haengt komplett und nur ein physischer
+# Reset hilft. Genau dieses Symptom ("morgens haengt die Steuerung") killt der
+# Timeout: send() wirft nach Ablauf ein OSError, das die vorhandene
+# Fehlerbehandlung faengt -> Reconnect + Health-Watchdog greifen wieder.
+# Bewusst kurz (< ~3,2 s Soft-WDT-Fenster), damit der Loop nach einem Stall
+# weiterlaeuft, bevor irgendein Watchdog zuschlaegt.
+MQTT_SOCKET_TIMEOUT = 2
 
 # Netzwerk-Keepalive (UDP an Gateway): haelt WLAN-MAC aktiv,
 # pflegt ARP-Cache der anderen Hosts im Subnet.
 udp_keepalive = None      # UDP-Socket fuer Outbound-Keepalive
 udp_keepalive_gw = None   # Gateway-IP (str) fuer das sendto
+
+# Connectivity-Watchdog: Der Hardware-WDT (3s) faengt nur CPU-Hangs.
+# Ein Netzwerk-Stall (WLAN noch "connected", aber MQTT-Socket tot, Loop
+# laeuft munter weiter und fuettert den WDT) ueberlebt den HW-WDT.
+# Darum tracken wir den letzten erfolgreichen MQTT-Publish und reseten
+# das System wenn zu lange Funkstille herrscht.
+last_successful_publish = 0          # ticks_ms() des letzten erfolgreichen publish
+last_health_check = 0                # ticks_ms() der letzten Health-Pruefung
+HEALTH_CHECK_INTERVAL_MS = 60000     # Health alle 60s pruefen
+HEALTH_SOFT_RECONNECT_MS = 300000    # Nach 5 min Stille: WLAN+MQTT neu verbinden
+HEALTH_HARD_RESET_MS = 900000        # Nach 15 min Stille: machine.reset()
+
+# Reset-Cause-Diagnose: boot.py schreibt /_boot_info.txt mit dem letzten
+# reset_cause(). Nach dem ersten erfolgreichen MQTT-Connect publishen wir
+# das einmal auf tele/solar/BOOT (retained) - so kann der Broker auch nach
+# einem 'raetselhaften' Stall belegen, welcher Reset-Typ wirklich gegriffen hat.
+_boot_info_published = False
 
 # System-Status für Monitoring
 system_status = {
@@ -107,106 +119,177 @@ system_status = {
     'ntp_sync_count': 0   # Anzahl erfolgreicher NTP-Synchronisationen
 }
 
+# HTML Template
+html_template = """<!DOCTYPE html>
+<html><head>
+<meta http-equiv='refresh' content='5'>
+<meta charset='UTF-8'>
+<style>
+body {{ background:#fff; font-family:sans-serif; padding:10px; }}
+b {{ font-size:16px; }}
+small {{ color:#666; }}
+.emerg {{ background:#c00; color:#fff; padding:6px; margin-bottom:8px; font-weight:bold; }}
+input,button {{ padding:4px; margin:2px; font-size:14px; }}
+form {{ margin:8px 0; }}
+</style></head><body>
+{8}
+<b>Solarpanel</b><br>
+Aktuell: {0} <small>(roh: {6})</small><br>
+Ziel: {1:.1f}°<br>
+Motor: {2}<br>
+Bereich: {3:.1f}° – {7:.1f}°<br>
+Tracking: {9}<br>
+<form method='POST'>
+<input name='minangle' type='number' step='0.1' value='{4:.1f}'>
+<input name='save' type='submit' value='Min setzen'>
+<input name='reset' type='submit' value='Reset'>
+</form>
+<form method='POST'>
+<button name='manual' value='down'>⬇️</button>
+<button name='manual' value='up'>⬆️</button>
+<button name='manual' value='auto'>🔁</button>
+</form><small>Zeit: {5}</small>
+</body></html>"""
+
 # =============================================================================
 # HILFSFUNKTIONEN
 # =============================================================================
 
-def _solar_elevation_at(offset_hours=0.0):
-    """Sonnen-Elevation (Grad) zu now + offset_hours. Fuer Sunset-Vorausschau."""
-    t = time.localtime()
-    doy = t[7]
-    local_hour = t[3] + t[4]/60.0 + t[5]/3600.0 + offset_hours
-    utc_hour = local_hour - tz_offset_hours
-    lat = math.radians(getattr(env, "LATITUDE", 48.066))
-    lon = getattr(env, "LONGITUDE", 11.667)
-    B = math.radians(360.0/365.0 * (doy - 81))
-    decl = math.radians(23.45) * math.sin(B)
-    eot_min = 9.87*math.sin(2*B) - 7.53*math.cos(B) - 1.5*math.sin(B)
-    solar_time = utc_hour + lon/15.0 + eot_min/60.0
-    H = math.radians((solar_time - 12.0) * 15.0)
-    sin_elev = math.sin(decl)*math.sin(lat) + math.cos(decl)*math.cos(lat)*math.cos(H)
-    sin_elev = max(-1.0, min(1.0, sin_elev))
-    return math.degrees(math.asin(sin_elev))
-
-def _solar_position():
-    """Aktuelle Sonnenposition (elevation, azimuth) in Grad.
-    Azimuth: 0=Nord, 90=Ost, 180=Sued, 270=West."""
-    t = time.localtime()
-    doy = t[7]
-    local_hour = t[3] + t[4]/60.0 + t[5]/3600.0
-    utc_hour = local_hour - tz_offset_hours
-    lat = math.radians(getattr(env, "LATITUDE", 48.066))
-    lon = getattr(env, "LONGITUDE", 11.667)
-    B = math.radians(360.0/365.0 * (doy - 81))
-    decl = math.radians(23.45) * math.sin(B)
-    eot_min = 9.87*math.sin(2*B) - 7.53*math.cos(B) - 1.5*math.sin(B)
-    solar_time = utc_hour + lon/15.0 + eot_min/60.0
-    H = math.radians((solar_time - 12.0) * 15.0)
-    sin_elev = math.sin(decl)*math.sin(lat) + math.cos(decl)*math.cos(lat)*math.cos(H)
-    sin_elev = max(-1.0, min(1.0, sin_elev))
-    elev = math.asin(sin_elev)
-    den = math.cos(elev)*math.cos(lat)
-    if abs(den) < 1e-9:
-        azi = math.pi
-    else:
-        cos_azi = (math.sin(decl) - math.sin(elev)*math.sin(lat)) / den
-        cos_azi = max(-1.0, min(1.0, cos_azi))
-        azi = math.acos(cos_azi)
-    if H > 0:
-        azi = 2*math.pi - azi
-    return math.degrees(elev), math.degrees(azi)
-
-
 def calculate_optimal_angle():
-    """Azimut-aware Optimum-Tilt fuer Panel mit Sued-Kippung (E-W-Achse).
-    Formel: t = atan2(-cos(az)*cos(elev), sin(elev))
-    - az=180deg (Sued, Mittag): t = 90 - elev (frueheres Verhalten, exakt gleich)
-    - az<>180: optimaler Tilt projiziert die Sonne auf die N-S-Kippebene.
-      Morgen/Abend (Sonne stark E/W) -> flacher Tilt, weil Steil-Kippung
-      auf Sued-Achse keinen Beitrag mehr bringt -> mehr Ertrag aus Cosinus.
-    Auf MIN/MAX clamped. Bei Sonne unter Horizont: MIN_ANGLE."""
+    """Optimaler Panel-Neigungswinkel (Grad zur Horizontalen, Sued-Ausrichtung)
+    so dass die direkte Sonneneinstrahlung moeglichst senkrecht aufs Panel trifft.
+
+    beta_opt = 90 - Sonnenhoehe(t, lat, lon)
+    Sonnenhoehe per Standard-Astronomie (Deklination + Stundenwinkel).
+    Frueher hier: base+decl+seasonal - das stand im Sommer falsch herum (steiler
+    statt flacher) und lag bei hoher Sonne ~25 Grad daneben.
+    """
     try:
-        elev_deg, az_deg = _solar_position()
-        if elev_deg <= 0:
-            return env.MIN_ANGLE
-        elev_r = math.radians(elev_deg)
-        az_r = math.radians(az_deg)
-        # Optimaler Tilt fuer Sued-tiltendes Panel (E-W Rotationsachse).
-        # Negative Werte -> noerdlicher Tilt; bei uns nie erwuenscht -> auf 0 clampen.
-        tilt_r = math.atan2(-math.cos(az_r) * math.cos(elev_r), math.sin(elev_r))
-        tilt_deg = math.degrees(tilt_r)
-        if tilt_deg < 0:
-            tilt_deg = 0.0
-        min_a = env.MIN_ANGLE
+        # Standort Muenchen
+        lat = 48.1351
+        lon = 11.5820
+
+        # ESP-RTC laeuft auf lokaler Wandzeit (MEZ/MESZ, gesetzt in sync_time).
+        # Fuer den Stundenwinkel brauchen wir UTC.
+        t = time.localtime()
+        month = t[1]
+        hour = t[3]
+        minute = t[4]
+        doy = t[7]
+
+        # MESZ etwa April-September, MEZ Nov-Februar. In Maerz/Oktober ist die
+        # Heuristik um max 2 Tage daneben - das verschiebt beta_opt um <0.3 Grad.
+        is_dst = 4 <= month <= 9 or month in (3, 10)
+        tz_offset_h = 2 if is_dst else 1
+        utc_h = (hour - tz_offset_h) + minute / 60.0
+
+        # Deklination der Sonne
+        decl = 23.45 * math.sin(math.radians(360 / 365 * (doy - 81)))
+
+        # Zeitgleichung (Minuten)
+        B = math.radians(360 / 365 * (doy - 81))
+        eot = 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)
+
+        # Wahre Ortszeit am Laengengrad (Stunden)
+        lst = utc_h + lon / 15.0 + eot / 60.0
+
+        # Stundenwinkel (Grad, 0=Mittag, positiv = Nachmittag/West)
+        omega = math.radians((lst - 12.0) * 15.0)
+
+        # Sonnenhoehe ueber Horizont
+        phi = math.radians(lat)
+        delta = math.radians(decl)
+        sin_h = math.sin(phi) * math.sin(delta) + math.cos(phi) * math.cos(delta) * math.cos(omega)
+        if sin_h > 1.0:
+            sin_h = 1.0
+        elif sin_h < -1.0:
+            sin_h = -1.0
+        elevation = math.degrees(math.asin(sin_h))
+
+        optimal = 90.0 - elevation
+
+        print("Astro: doy={} decl={:.1f} lst={:.2f}h elev={:.1f} beta_opt={:.1f}".format(
+            doy, decl, lst, elevation, optimal))
+
+        # Auf mechanische Endlagen des Aktuators clampen
         max_a = getattr(env, "MAX_ANGLE", 70.0)
-        result = max(min_a, min(max_a, tilt_deg))
-        print("Sonne: elev={:.1f}deg az={:.1f}deg -> opt={:.1f}deg -> Ziel={:.1f}deg".format(
-            elev_deg, az_deg, tilt_deg, result))
-        return round(result, 1)
+        return max(env.MIN_ANGLE, min(max_a, round(optimal, 1)))
     except Exception as e:
         print("Winkel-Berechnung Fehler:", e)
         return env.MIN_ANGLE
 
 def is_night():
-    """Nacht-/Ruhephase fuer den Tracker.
-    - Morgens: Nacht, solange die Sonne noch nicht ueber dem Horizont steht -
-      echte astronomische Berechnung statt festem MORNING_START_HOUR-Cutoff
-      (der ignorierte den echten Sonnenaufgang und war inkonsistent zur
-      bereits astronomisch berechneten Abendseite).
-    - Abends: pruefen, ob in SUNSET_MARGIN_HOURS (Default 1.0 h) die Sonne unter
-      dem Horizont steht. Wenn ja -> jetzt schon flach hinlegen.
-    - Fallback bei Rechenfehler: alte feste Stunden-Logik (sunrise/sunset)."""
     t = time.localtime()
-    morning_start = int(getattr(env, "MORNING_START_HOUR", 8))
+    return t[3] < sunrise or t[3] >= sunset
+
+def calculate_sunset_local_h():
+    """Sonnenuntergang als lokale Wandzeit in Stunden (Float, z.B. 21.5 = 21:30).
+    Aus dem Stundenwinkel beim Untergang: cos(omega) = -tan(phi)*tan(delta).
+    Selbe Astronomie-Konstanten wie calculate_optimal_angle()."""
     try:
-        if _solar_elevation_at(0.0) <= 0.0:
-            return True
-        margin = float(getattr(env, "SUNSET_MARGIN_HOURS", 1.0))
-        if _solar_elevation_at(margin) <= 0.0:
-            return True
-        return False
+        lat = 48.1351
+        lon = 11.5820
+        t = time.localtime()
+        month = t[1]
+        doy = t[7]
+        is_dst = 4 <= month <= 9 or month in (3, 10)
+        tz_offset_h = 2 if is_dst else 1
+
+        decl = 23.45 * math.sin(math.radians(360 / 365 * (doy - 81)))
+        B = math.radians(360 / 365 * (doy - 81))
+        eot = 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)
+
+        phi = math.radians(lat)
+        delta = math.radians(decl)
+        cos_omega = -math.tan(phi) * math.tan(delta)
+        if cos_omega < -1.0 or cos_omega > 1.0:
+            # Polartag/Polarnacht - in Muenchen unerreichbar. Fallback.
+            return 18.0
+        omega_sunset_rad = math.acos(cos_omega)
+        half_day_h = math.degrees(omega_sunset_rad) / 15.0
+        lst_sunset = 12.0 + half_day_h
+        local_h = lst_sunset - lon / 15.0 - eot / 60.0 + tz_offset_h
+        if local_h < 0:
+            local_h += 24
+        if local_h >= 24:
+            local_h -= 24
+        return local_h
+    except Exception as e:
+        print("Sunset-Berechnung Fehler:", e)
+        return 18.0
+
+def _current_local_h():
+    t = time.localtime()
+    return t[3] + t[4] / 60.0 + t[5] / 3600.0
+
+def _fmt_hours_hhmm(h):
+    """Float-Stunde -> 'HH:MM' (z.B. 20.5 -> '20:30')."""
+    try:
+        if h < 0:
+            h += 24
+        if h >= 24:
+            h -= 24
+        hh = int(h)
+        mm = int(round((h - hh) * 60))
+        if mm == 60:
+            hh = (hh + 1) % 24
+            mm = 0
+        return "{:02d}:{:02d}".format(hh, mm)
     except Exception:
-        return t[3] < morning_start or t[3] >= sunset
+        return "--:--"
+
+def tracking_window():
+    """Liefert (start_h, end_h) des heutigen Aktiv-Fensters in lokalen Stunden."""
+    start_h = TRACK_START_H
+    end_h = calculate_sunset_local_h() - TRACK_END_BEFORE_SUNSET_H
+    return start_h, end_h
+
+def is_tracking_active():
+    """True wenn das Panel aktuell aktiv nachgefuehrt werden soll.
+    Ausserhalb -> target wird auf MIN_ANGLE gezogen (Panel flach)."""
+    start_h, end_h = tracking_window()
+    now_h = _current_local_h()
+    return start_h <= now_h < end_h
 
 def get_formatted_time():
     """Formatierte deutsche Zeit zurückgeben"""
@@ -225,11 +308,10 @@ def sync_time():
         import ntptime
         print("Synchronisiere Zeit via NTP...")
         
-        # NTP-Server: GW zuerst (VLAN12 blockt externes UDP/123), externe als Fallback
+        # Deutsche NTP-Server verwenden
         ntp_servers = [
-            "10.10.12.1",
             "pool.ntp.org",
-            "de.pool.ntp.org",
+            "de.pool.ntp.org", 
             "time.google.com",
             "ptbtime1.ptb.de"
         ]
@@ -297,8 +379,6 @@ def sync_time():
             
             # Zeitzone anwenden
             tz_offset = 7200 if is_dst else 3600  # MESZ: UTC+2, MEZ: UTC+1
-            global tz_offset_hours
-            tz_offset_hours = 2 if is_dst else 1
             local_timestamp = time.mktime(utc_time) + tz_offset
             local_time = time.localtime(local_timestamp)
             
@@ -342,57 +422,12 @@ def sync_time():
 # MQTT FUNKTIONEN
 # =============================================================================
 
-def load_calibration():
-    """Persistierten Offset aus /calib.json laden (ueberschreibt env-Defaults)."""
-    try:
-        with open("/calib.json", "r") as f:
-            d = ujson.loads(f.read())
-        if "SENSOR_OFFSET" in d:
-            env.SENSOR_OFFSET = float(d["SENSOR_OFFSET"])
-            print("Calib geladen: SENSOR_OFFSET =", env.SENSOR_OFFSET)
-        if "SENSOR_SIGN" in d:
-            env.SENSOR_SIGN = int(d["SENSOR_SIGN"])
-            print("Calib geladen: SENSOR_SIGN =", env.SENSOR_SIGN)
-    except OSError:
-        pass  # keine Calib-Datei -> env-Defaults aktiv
-    except Exception as e:
-        print("Calib-Load Fehler:", e)
-
-
-def save_calibration():
-    """Aktuellen Offset/Sign nach /calib.json persistieren."""
-    try:
-        d = {
-            "SENSOR_OFFSET": getattr(env, "SENSOR_OFFSET", 0.0),
-            "SENSOR_SIGN": getattr(env, "SENSOR_SIGN", 1),
-        }
-        with open("/calib.json", "w") as f:
-            f.write(ujson.dumps(d))
-        print("Calib gespeichert:", d)
-        return True
-    except Exception as e:
-        print("Calib-Save Fehler:", e)
-        return False
-
-
 def mqtt_on_message(topic, msg):
-    """Callback fuer eingehende MQTT-Befehle (cmnd/solar/...) und Self-Echo."""
-    global emergency_mode, target, manual_override, angle, current_angle, motion_dir
-    global last_ping_sent_token, last_echo_seen_ticks
+    """Callback fuer eingehende MQTT-Befehle (cmnd/solar/...)."""
+    global emergency_mode, target, manual_override, angle
     try:
         t = topic.decode() if isinstance(topic, (bytes, bytearray)) else topic
-        m_raw = msg.decode() if isinstance(msg, (bytes, bytearray)) else msg
-        # Echo-Topic ist hot-path (alle 60s) - nicht spammig loggen
-        if t.endswith("/PING_ECHO"):
-            last_echo_seen_ticks = time.ticks_ms()
-            # Wenn empfangener Token == zuletzt gesendeter, ist Roundtrip bestaetigt
-            try:
-                if int(m_raw) == last_ping_sent_token:
-                    last_ping_sent_token = 0  # consumed
-            except Exception:
-                pass
-            return
-        m = m_raw.strip().lower()
+        m = (msg.decode() if isinstance(msg, (bytes, bytearray)) else msg).strip().lower()
         print("MQTT cmd:", t, "=", m)
         if t.endswith("/EMERGENCY"):
             new = m in ("on", "1", "true", "yes")
@@ -405,80 +440,30 @@ def mqtt_on_message(topic, msg):
                     mqtt_publish_debug("Emergency ON")
                 else:
                     angle = calculate_optimal_angle()
-                    target = angle if not is_night() else env.MIN_ANGLE
+                    target = angle if is_tracking_active() else env.MIN_ANGLE
                     print("EMERGENCY OFF - target={:.1f}".format(target))
                     mqtt_publish_debug("Emergency OFF")
+                # State sofort zurueckspiegeln
                 try:
                     mqtt.publish(f"{env.MQTT_TOPIC_SENSOR}/Emergency", "true" if new else "false")
                 except:
                     pass
-        elif t.endswith("/SETANGLE"):
-            # Live-Kalibrierung: User misst echten Winkel, schickt Wert -> wir
-            # rechnen den Offset so, dass PanelAngle dem entspricht. raw bleibt,
-            # nur env.SENSOR_OFFSET wird angepasst und persistiert.
-            try:
-                target_actual = float(m_raw.strip())
-            except Exception:
-                mqtt_publish_debug("SETANGLE: payload nicht numerisch")
-                return
-            if current_angle_raw is None:
-                mqtt_publish_debug("SETANGLE: noch kein MPU-Wert, ignoriert")
-                return
-            sign = getattr(env, "SENSOR_SIGN", 1) or 1
-            new_offset = current_angle_raw - (target_actual / sign)
-            env.SENSOR_OFFSET = new_offset
-            save_calibration()
-            current_angle = round(sign * (current_angle_raw - new_offset), 1)
-            print("Kalibrierung: SENSOR_OFFSET={:.2f} (raw={:.2f} -> {:.1f}deg)".format(
-                new_offset, current_angle_raw, target_actual))
-            mqtt_publish_debug("SETANGLE {:.1f}deg -> offset={:.2f}".format(target_actual, new_offset))
-            # Werte sofort frisch publizieren, sonst sieht HA 30s alte JSON
-            try:
-                mqtt_publish_sensor_data()
-            except:
-                pass
-        elif t.endswith("/RECALC"):
-            # Manueller Trigger: Sun-Position sofort neu rechnen
-            angle = calculate_optimal_angle()
-            if not emergency_mode and not is_night():
-                target = angle
-            mqtt_publish_debug("Recalc angle={:.1f}deg target={:.1f}deg".format(angle, target))
-        elif t.endswith("/MANUAL"):
-            # Manuelle Motor-Steuerung (ersetzt die alten Web-Buttons)
-            # Payload: up|down|auto. Emergency hat weiter Vorrang.
-            if emergency_mode:
-                mqtt_publish_debug("Manual ignored: emergency active")
-                return
-            if m == "up":
-                manual_override = True
-                rel1.off(); rel2.on()
-                motion_dir = 1
-                mqtt_publish_debug("Manual: Up")
-            elif m == "down":
-                manual_override = True
-                rel1.on(); rel2.off()
-                motion_dir = 2
-                mqtt_publish_debug("Manual: Down")
-            elif m == "auto":
-                manual_override = False
-                rel1.off(); rel2.off()
-                motion_dir = 0
-                mqtt_publish_debug("Auto mode")
-            else:
-                mqtt_publish_debug("Manual: unknown payload " + m_raw[:16])
-        elif t.endswith("/MIN_ANGLE"):
-            # Min-Angle setzen (clamp 0..70). Ersatz fuer Web-Form.
-            try:
-                v = float(m_raw.strip())
-                env.MIN_ANGLE = max(0.0, min(70.0, v))
-                mqtt_publish_debug("MIN_ANGLE={:.1f}".format(env.MIN_ANGLE))
-                # Wenn Emergency/Nacht aktiv, target sofort nachziehen
-                if emergency_mode or is_night():
-                    target = env.MIN_ANGLE
-            except Exception:
-                mqtt_publish_debug("MIN_ANGLE: payload nicht numerisch")
     except Exception as e:
         print("MQTT-Callback Fehler:", e)
+
+
+def _mqtt_arm_timeout():
+    """Setzt den Socket-Timeout auf dem aktiven MQTT-Socket (neu).
+    MUSS vor jedem blockierenden publish()/ping()/disconnect() aufgerufen
+    werden: umqtt.simple.check_msg() setzt den Socket per setblocking(True)
+    jedes Mal wieder auf 'blockierend OHNE Timeout' zurueck. Ohne dieses
+    Neu-Setzen kann ein einzelnes publish() den Loop fuer immer einfrieren
+    (siehe Kommentar bei MQTT_SOCKET_TIMEOUT)."""
+    try:
+        if mqtt is not None and getattr(mqtt, 'sock', None) is not None:
+            mqtt.sock.settimeout(MQTT_SOCKET_TIMEOUT)
+    except Exception:
+        pass
 
 
 def mqtt_connect():
@@ -486,6 +471,9 @@ def mqtt_connect():
     global mqtt, mqtt_connected, system_status
     try:
         if mqtt:
+            # Alter Socket koennte haengen -> Timeout setzen, damit das
+            # disconnect() (sendet ein DISCONNECT-Paket) nicht blockiert.
+            _mqtt_arm_timeout()
             try:
                 mqtt.disconnect()
             except:
@@ -500,50 +488,27 @@ def mqtt_connect():
             keepalive=60
         )
         mqtt.set_callback(mqtt_on_message)
-        # MQTT-LWT: Broker schreibt "Offline" retain auf tele/solar/LWT, sobald
-        # die TCP/keepalive-Verbindung wegbricht (haengender ESP, WLAN-Drop).
-        # MUSS vor connect() gesetzt werden.
-        try:
-            mqtt.set_last_will(b"tele/solar/LWT", b"Offline", retain=True, qos=0)
-        except Exception as e:
-            print("LWT-Setup Fehler:", e)
         mqtt.connect()
         mqtt_connected = True
-        # Online-Marker (retained) - ueberschreibt das LWT-"Offline" beim Reconnect.
-        try:
-            mqtt.publish(b"tele/solar/LWT", b"Online", retain=True)
-        except Exception as e:
-            print("LWT-Online-Publish Fehler:", e)
+        # Frischer Socket -> sofort Timeout setzen, schuetzt alle folgenden
+        # publish()/ping()-Aufrufe vor dem Endlos-Block.
+        _mqtt_arm_timeout()
         print(f"MQTT verbunden mit {env.MQTT_SERVER}:{env.MQTT_PORT}")
 
         # Subscribe auf Command-Topics (retain-Messages kommen sofort)
         cmd_base = getattr(env, 'MQTT_TOPIC_CMD', 'cmnd/solar')
-        for sub in ("/EMERGENCY", "/SETANGLE", "/RECALC", "/MANUAL", "/MIN_ANGLE"):
-            try:
-                mqtt.subscribe(cmd_base + sub)
-                print("Subscribed:", cmd_base + sub)
-            except Exception as e:
-                print("Subscribe-Fehler:", cmd_base + sub, e)
-
-        # Self-Echo-Watchdog: auf eigenen PING_ECHO-Topic subscriben.
-        # Broker liefert eigene publishes zurueck -> wir sehen sicher dass
-        # publish + receive WIRKLICH durch's Netz gegangen sind (nicht nur
-        # ein QoS=0 fire-and-forget das stillschweigend verloren ging).
+        cmd_topic = cmd_base + "/EMERGENCY"
         try:
-            mqtt.subscribe(b"tele/solar/PING_ECHO")
-            print("Subscribed: tele/solar/PING_ECHO (Self-Echo-Watchdog)")
+            mqtt.subscribe(cmd_topic)
+            print("Subscribed:", cmd_topic)
         except Exception as e:
-            print("Subscribe-Fehler PING_ECHO:", e)
+            print("Subscribe-Fehler:", e)
 
         # Status-Nachricht senden
         mqtt_publish_status("online", retain=True)
 
-        # Boot-Info einmalig retained publizieren (aus /_boot_info.txt von boot.py)
-        try:
-            _publish_boot_info_once()
-        except Exception as e:
-            print("Boot-Info-Publish Fehler:", e)
-
+        # Boot-Diagnose einmalig publishen (retained, ueberlebt also Broker-Restart)
+        _publish_boot_info_once()
         return True
 
     except Exception as e:
@@ -552,40 +517,19 @@ def mqtt_connect():
         print(f"MQTT-Verbindung fehlgeschlagen: {e}")
         return False
 
-def _publish_boot_info_once():
-    """Liest /_boot_info.txt (von boot.py geschrieben) und publiziert es
-    einmalig retained nach tele/solar/BOOT, damit HA den letzten Reset-Grund
-    auch dann sieht, wenn der ESP gerade offline ist."""
-    global _boot_info_published
-    if _boot_info_published or not mqtt_connected:
-        return
-    try:
-        with open("_boot_info.txt", "r") as f:
-            line = f.read().strip()
-    except OSError:
-        line = "rc=UNK code=-1 heap=0 t=0"
-    try:
-        t = time.localtime()
-        ts = "{:02d}.{:02d}.{:04d} {:02d}:{:02d}:{:02d}".format(
-            t[2], t[1], t[0], t[3], t[4], t[5])
-    except Exception:
-        ts = ""
-    dev = getattr(env, "MQTT_CLIENT_ID", "esp_solar")
-    payload = '{"Time":"' + ts + '","Boot":"' + line + '","Device":"' + dev + '"}'
-    try:
-        mqtt.publish("tele/solar/BOOT", payload, retain=True)
-        _boot_info_published = True
-        print("BOOT publiziert:", payload)
-    except Exception as e:
-        print("tele/solar/BOOT publish Fehler:", e)
-
 def mqtt_publish_sensor_data():
     """Sensordaten via MQTT veröffentlichen"""
-    global system_status, last_successful_publish_ticks
+    global system_status, last_successful_publish, mqtt_connected
     if not mqtt_connected:
         return False
     
     try:
+        # Heap defragmentieren BEVOR der grosse JSON-Payload gebaut wird -
+        # der ESP8266 laeuft chronisch knapp (~6 kB frei), und genau dieser
+        # Publish ist der groesste Einzel-Allokationspeak im Loop.
+        gc.collect()
+        # check_msg() hat den Socket-Timeout evtl. geloescht -> neu setzen.
+        _mqtt_arm_timeout()
         # System-Status aktualisieren
         system_status['uptime'] = time.ticks_ms() // 1000
         system_status['heap_free'] = gc.mem_free()
@@ -615,7 +559,10 @@ def mqtt_publish_sensor_data():
                 "MotionText": ["Stopp", "Hoch", "Runter"][motion_dir],
                 "Manual": manual_override,
                 "Emergency": emergency_mode,
-                "IsNight": is_night()
+                "IsNight": is_night(),
+                "TrackingActive": is_tracking_active(),
+                "TrackingStart": _fmt_hours_hhmm(tracking_window()[0]),
+                "TrackingEnd": _fmt_hours_hhmm(tracking_window()[1])
             },
             "SYSTEM": {
                 "Uptime": system_status['uptime'],
@@ -631,26 +578,46 @@ def mqtt_publish_sensor_data():
             }
         }
 
-        # Nur EIN JSON-Payload publishen (HA holt sich Werte per value_template).
-        # Frueher: 1 JSON + 11 Einzeltopics = 12 publish/Cycle = ~12kB Heap-Burn.
-        # Heute: 1 publish, GC vor und nach dumps fuer minimale Heap-Spitze.
-        gc.collect()
+        # JSON-Payload senden
         payload = ujson.dumps(sensor_data)
-        sensor_data = None  # Referenz freigeben vor publish
         mqtt.publish(env.MQTT_TOPIC_SENSOR, payload)
-        payload = None
-        gc.collect()
 
-        # %-format statt f-string: spart String-Allocations im hot path
-        print("MQTT-Daten gesendet: Panel=%.1f Ziel=%.1f Sonne=%.1f Heap=%d" %
-              (current_angle if current_angle is not None else -999.0,
-               target, angle, gc.mem_free()))
-        last_successful_publish_ticks = time.ticks_ms()
+        # Einzelne Topics fuer Home-Assistant-Sensoren (HA mag das lieber als JSON-Pfade)
+        base = env.MQTT_TOPIC_SENSOR
+        max_a = getattr(env, "MAX_ANGLE", 70.0)
+        mqtt.publish(f"{base}/PanelAngle",    str(round(current_angle, 1)) if current_angle is not None else "null")
+        mqtt.publish(f"{base}/PanelAngleRaw", str(round(current_angle_raw, 1)) if current_angle_raw is not None else "null")
+        mqtt.publish(f"{base}/TargetAngle",   str(round(target, 1)))
+        mqtt.publish(f"{base}/SunAngle",      str(round(angle, 1)))
+        mqtt.publish(f"{base}/Motion",        str(motion_dir))
+        mqtt.publish(f"{base}/MotionText",    ["Stopp", "Hoch", "Runter"][motion_dir])
+        mqtt.publish(f"{base}/Manual",        "true" if manual_override else "false")
+        mqtt.publish(f"{base}/MinAngle",      str(round(env.MIN_ANGLE, 1)))
+        mqtt.publish(f"{base}/MaxAngle",      str(round(max_a, 1)))
+        mqtt.publish(f"{base}/IsNight",       "true" if is_night() else "false")
+        mqtt.publish(f"{base}/Emergency",     "true" if emergency_mode else "false")
+        # Tracking-Status fuer HA-Sensoren
+        _ts, _te = tracking_window()
+        mqtt.publish(f"{base}/TrackingActive", "true" if is_tracking_active() else "false")
+        mqtt.publish(f"{base}/TrackingStart",  _fmt_hours_hhmm(_ts))
+        mqtt.publish(f"{base}/TrackingEnd",    _fmt_hours_hhmm(_te))
+
+        # current_angle kann None sein (vereinzelter I2C-Read-Fehler) - dann darf
+        # die f-string-Formatierung nicht crashen, sonst wird last_successful_publish
+        # nie aktualisiert und der Health-Watchdog feuert einen falsch-positiven Reset.
+        panel_str = "{:.1f}".format(current_angle) if current_angle is not None else "None"
+        print("MQTT-Daten gesendet: Panel={}°, Ziel={:.1f}°, Sonne={:.1f}°".format(panel_str, target, angle))
+        # Health-Marker: Beweis dass die MQTT-Pipe wirklich Daten transportiert hat.
+        last_successful_publish = time.ticks_ms()
         return True
 
     except Exception as e:
-        print("MQTT-Publish Fehler:", e)
-        system_status['last_error'] = "MQTT publish error: " + str(e)
+        print(f"MQTT-Publish Fehler: {e}")
+        system_status['last_error'] = f"MQTT publish error: {str(e)}"
+        # Publish gescheitert (z.B. Socket-Timeout) -> Verbindung als tot
+        # markieren, damit mqtt_check_connection() sauber neu verbindet,
+        # statt 30 s spaeter wieder in denselben Timeout zu laufen.
+        mqtt_connected = False
         return False
 
 def mqtt_publish_status(status, retain=False):
@@ -659,6 +626,7 @@ def mqtt_publish_status(status, retain=False):
         return False
     
     try:
+        _mqtt_arm_timeout()
         status_data = {
             "Time": get_formatted_time(),
             "Status": status,
@@ -674,12 +642,67 @@ def mqtt_publish_status(status, retain=False):
         print(f"MQTT-Status Fehler: {e}")
         return False
 
+# Reset-Cause-Codes des ESP8266 (system_get_rst_info()->reason). Achtung:
+# diese decken sich NICHT 1:1 mit machine.*_RESET - Code 2 und 3 haben gar
+# keine machine-Konstante, darum hier die vollstaendige Tabelle.
+_RESET_CAUSE_NAMES = {
+    0: "PWRON",       # Kaltstart / Power-On
+    1: "HW_WDT",      # Hardware-Watchdog
+    2: "EXCEPTION",   # Firmware-Crash (fatal exception) - Verdacht: RAM-Mangel
+    3: "SOFT_WDT",    # Software-Watchdog (CPU-Stall > ~3,2 s)
+    4: "SOFT_RESET",  # machine.reset() - z.B. unser Health-Watchdog
+    5: "DEEPSLEEP",   # Deep-Sleep-Aufwachen
+    6: "EXT_RESET",   # externer Reset (Reset-Knopf / EN-Pin)
+}
+
+
+def _publish_boot_info_once():
+    """Sendet die Boot-Diagnose einmal pro Run auf tele/solar/BOOT (retained).
+
+    Quelle ist machine.reset_cause() LIVE - bewusst NICHT die Datei
+    _boot_info.txt: boot.py's Datei-Logging hat sich als unzuverlaessig
+    erwiesen (last_boot.txt friert ein, Schreibzugriffe schlagen still fehl).
+    reset_cause() dagegen stimmt immer. So zeigt das retained Topic nach
+    einem naechtlichen Stall verlaesslich, welcher Reset-Typ gegriffen hat -
+    ohne dass man live am USB haengen muss."""
+    global _boot_info_published
+    if _boot_info_published or not mqtt_connected:
+        return
+    try:
+        rc = machine.reset_cause()
+    except Exception:
+        rc = -1
+    rc_name = _RESET_CAUSE_NAMES.get(rc, "UNK")
+    try:
+        with open("_boot_info.txt", "r") as f:
+            file_info = f.read().strip()
+    except OSError:
+        file_info = "(no file)"
+    try:
+        _mqtt_arm_timeout()
+        payload = ujson.dumps({
+            "Time": get_formatted_time(),
+            "ResetCause": rc,
+            "ResetName": rc_name,
+            "HeapFree": gc.mem_free(),
+            "BootFile": file_info,
+            "Device": env.MQTT_CLIENT_ID
+        })
+        mqtt.publish("tele/solar/BOOT", payload, retain=True)
+        _boot_info_published = True
+        print("MQTT BOOT info published: cause={} ({}) heap={}".format(
+            rc, rc_name, gc.mem_free()))
+    except Exception as e:
+        print("BOOT-Publish Fehler:", e)
+
+
 def mqtt_publish_debug(message):
     """Debug-Nachricht via MQTT senden"""
     if not mqtt_connected:
         return False
     
     try:
+        _mqtt_arm_timeout()
         debug_data = {
             "Time": get_formatted_time(),
             "Debug": message,
@@ -694,6 +717,74 @@ def mqtt_publish_debug(message):
     except Exception as e:
         print(f"MQTT-Debug Fehler: {e}")
         return False
+
+def health_check():
+    """Connectivity-Watchdog: erkennt Netzwerk-Stalls die der HW-WDT nicht sieht.
+
+    Trigger ist 'Zeit seit letztem erfolgreichen MQTT-Publish'. Da der Loop
+    alle 30s ein publish versucht, ist 5 min Stille schon ein klares Signal
+    dass die TCP-Pipe oder das WLAN-Routing hin sind, obwohl wlan.isconnected()
+    noch True meldet (typischer FritzBox-/Modem-Sleep-Stall).
+
+    Eskalation:
+      - >5 min Stille  -> sanfter Reconnect (WLAN disconnect+connect + MQTT-Reconnect)
+      - >15 min Stille -> harter machine.reset() (WLAN-Stack komplett tot)
+    """
+    global last_health_check, last_successful_publish
+
+    current_time = time.ticks_ms()
+    if time.ticks_diff(current_time, last_health_check) < HEALTH_CHECK_INTERVAL_MS:
+        return
+    last_health_check = current_time
+
+    # Solange noch nie etwas publiziert wurde (frischer Boot ohne Broker)
+    # ist die Bezugszeit der Boot-Moment. Sonst kickt der Watchdog sofort.
+    if last_successful_publish == 0:
+        last_successful_publish = current_time
+        return
+
+    silence_ms = time.ticks_diff(current_time, last_successful_publish)
+    silence_s = silence_ms // 1000
+
+    if silence_ms > HEALTH_HARD_RESET_MS:
+        print("HEALTH: {} s ohne MQTT-Publish -> machine.reset()".format(silence_s))
+        try:
+            mqtt_publish_debug("Health: hard reset after {}s silence".format(silence_s))
+        except Exception:
+            pass
+        # Relays sicherheitshalber aus, bevor wir resetten
+        try:
+            rel1.off(); rel2.off()
+        except Exception:
+            pass
+        time.sleep(1)
+        machine.reset()
+
+    if silence_ms > HEALTH_SOFT_RECONNECT_MS:
+        print("HEALTH: {} s ohne MQTT-Publish -> WLAN+MQTT reconnect".format(silence_s))
+        try:
+            wlan = network.WLAN(network.STA_IF)
+            wlan.disconnect()
+            time.sleep_ms(500)
+            wlan.connect(env.WIFI_SSID, env.WIFI_PASSWORD)
+            # Kurz warten, dem WLAN Zeit fuers Reassoc geben - aber WDT (3s) im Blick
+            for _ in range(20):
+                if wlan.isconnected():
+                    break
+                if wdt is not None:
+                    wdt.feed()
+                time.sleep_ms(100)
+            # ARP-Cache am Gateway frisch halten
+            try:
+                if udp_keepalive is not None and udp_keepalive_gw is not None:
+                    udp_keepalive.sendto(b'.', (udp_keepalive_gw, 9))
+            except Exception:
+                pass
+        except Exception as e:
+            print("Health: WLAN-Reconnect Fehler:", e)
+        # MQTT-Reconnect erzwingen (mqtt_connect schliesst alten Socket implizit)
+        mqtt_connect()
+
 
 def mqtt_check_connection():
     """MQTT-Verbindung pruefen und ggf. wiederherstellen.
@@ -721,6 +812,7 @@ def mqtt_check_connection():
     # Ping gedrosselt: nur alle 30s (Standard-Keepalive-Pattern)
     if mqtt_connected and time.ticks_diff(current_time, last_mqtt_ping) > mqtt_ping_interval:
         try:
+            _mqtt_arm_timeout()
             mqtt.ping()
             last_mqtt_ping = current_time
         except:
@@ -728,14 +820,176 @@ def mqtt_check_connection():
             mqtt_connected = False
 
 # =============================================================================
+# WEBSERVER-FUNKTIONEN
+# =============================================================================
+
+def handle_web_request():
+    global manual_override, motion_dir
+    try:
+        # Check if connection is available (non-blocking)
+        conn, addr = srv.accept()
+        print("Client verbunden:", addr)
+
+        # WDT vor potenziell blockierender Operation fuettern - sonst kann
+        # Web-Request + UDP + Sensor zusammen ueber die 3s WDT-Frist gehen.
+        if wdt is not None:
+            wdt.feed()
+
+        # Set connection to blocking mode for reliable data transfer.
+        # 0.5s recv-Timeout: Browser sendet das Request in <100ms.
+        # Laenger waere nur "zaeher Client" - der darf gerne den WDT triggern.
+        conn.setblocking(True)
+        conn.settimeout(0.5)
+        
+        try:
+            # Receive request with timeout
+            request = conn.recv(1024)
+            if not request:
+                return
+            
+            # MicroPython compatible decode
+            try:
+                req_str = request.decode('utf-8')
+            except:
+                req_str = str(request)
+            
+            print("Request empfangen")
+            
+            # Handle POST requests
+            if "POST" in req_str:
+                if "minangle=" in req_str:
+                    try:
+                        # Find value between minangle= and next & or space
+                        start = req_str.find("minangle=") + 9
+                        end = req_str.find("&", start)
+                        if end == -1:
+                            end = req_str.find(" ", start)
+                        if end == -1:
+                            end = len(req_str)
+                        v = req_str[start:end]
+                        env.MIN_ANGLE = max(0, min(70, float(v)))
+                        print("Min-Angle gesetzt auf:", env.MIN_ANGLE)
+                    except Exception as e:
+                        print("Angle parse error:", e)
+                        
+                elif "reset" in req_str:
+                    env.MIN_ANGLE = 32.0
+                    print("Reset auf 32°")
+                    
+                elif "manual=" in req_str:
+                    try:
+                        start = req_str.find("manual=") + 7
+                        end = req_str.find("&", start)
+                        if end == -1:
+                            end = req_str.find(" ", start)
+                        if end == -1:
+                            end = len(req_str)
+                        m = req_str[start:end]
+                        
+                        if m == "up":
+                            manual_override = True
+                            rel1.off()
+                            rel2.on()
+                            motion_dir = 1
+                            print("Manuell: Hoch")
+                            mqtt_publish_debug("Manual: Up")
+                        elif m == "down":
+                            manual_override = True
+                            rel1.on()
+                            rel2.off()
+                            motion_dir = 2
+                            print("Manuell: Runter")
+                            mqtt_publish_debug("Manual: Down")
+                        elif m == "auto":
+                            manual_override = False
+                            rel1.off()
+                            rel2.off()
+                            motion_dir = 0
+                            print("Auto-Modus")
+                            mqtt_publish_debug("Auto mode")
+                    except Exception as e:
+                        print("Manual parse error:", e)
+            
+            # Prepare response
+            angle_text = "Fehler" if current_angle is None else "{:.1f}°".format(current_angle)
+            raw_text   = "--" if current_angle_raw is None else "{:.1f}°".format(current_angle_raw)
+            motion_text = ["Stopp", "Hoch", "Runter"][motion_dir]
+            current_time = get_formatted_time()
+            max_angle = getattr(env, "MAX_ANGLE", 70.0)
+
+            # Tracking-Status fuer das Web-Frontend - menschenlesbar
+            _start_h, _end_h = tracking_window()
+            _window_str = "{}-{}".format(_fmt_hours_hhmm(_start_h), _fmt_hours_hhmm(_end_h))
+            if is_tracking_active():
+                tracking_text = "aktiv (Fenster {})".format(_window_str)
+            else:
+                tracking_text = "pausiert - Panel flach (Fenster {})".format(_window_str)
+
+            emerg_banner = "<div class='emerg'>NOTFALL aktiv - Panel flach auf MIN_ANGLE</div>" if emergency_mode else ""
+            response_body = html_template.format(
+                angle_text, target, motion_text, env.MIN_ANGLE, env.MIN_ANGLE,
+                current_time, raw_text, max_angle, emerg_banner, tracking_text
+            )
+            
+            # Send complete HTTP response
+            response = "HTTP/1.1 200 OK\r\n"
+            response += "Content-Type: text/html; charset=UTF-8\r\n"
+            response += "Content-Length: {}\r\n".format(len(response_body))
+            response += "Connection: close\r\n"
+            response += "\r\n"
+            response += response_body
+            
+            # MicroPython compatible send mit send-Loop (single send() kann
+            # bei >1KB truncieren, dann sieht der Client einen IncompleteRead).
+            data = response.encode('utf-8')
+            sent = 0
+            while sent < len(data):
+                n = conn.send(data[sent:])
+                if not n:
+                    break
+                sent += n
+            print("Response gesendet ({} bytes)".format(sent))
+            
+        except OSError as e:
+            if e.args[0] != 11:  # Ignore EAGAIN
+                print("Request handling error:", e)
+        except Exception as e:
+            print("Request handling error:", e)
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+                
+    except OSError as e:
+        # EAGAIN (11) means no connection available - this is normal
+        if e.args[0] != 11:
+            print("Connection error:", e)
+    except Exception as e:
+        print("Unexpected error:", e)
+
+def start_web():
+    global srv
+    try:
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('0.0.0.0', 80))
+        srv.listen(2)  # Erhöhte Queue
+        srv.setblocking(False)
+        print("Webserver läuft auf Port 80")
+        return True
+    except Exception as e:
+        print("Webserver Start-Fehler:", e)
+        return False
+
+# =============================================================================
 # HAUPTFUNKTIONEN
 # =============================================================================
 
 def loop():
     global current_angle, current_angle_raw, motion_dir, manual_override, angle, target
-    global last_mqtt_publish, system_status, mqtt_connected, last_successful_publish_ticks
-    global last_ping_sent_token, last_ping_sent_ticks, last_echo_seen_ticks
-
+    global last_mqtt_publish, system_status
+    
     last_sensor_read = 0
     last_angle_calc = 0
     last_time_sync = 0
@@ -744,8 +998,6 @@ def loop():
     last_gc = 0
     last_sleep_check = 0
     last_keepalive = 0
-    last_wlan_check = 0
-    WLAN_CHECK_INTERVAL_MS = 30000   # alle 30s pruefen ob Assoziation noch steht
 
     # Regelungs-Konstanten
     SENSOR_INTERVAL_MS = 150        # MPU schnell pollen, damit Stop sofort greift
@@ -758,105 +1010,14 @@ def loop():
         try:
             current_time = time.ticks_ms()
 
-            # WLAN-Assoziation pruefen - wenn Bad!Net/AP wegfaellt,
-            # bleibt der ESP sonst stundenlang ohne Netzwerk-Stack erreichbar
-            # waehrend der Loop weiterlaeuft + WDT brav gefuettert wird.
-            # Vor MQTT-Check, damit ein MQTT-Reconnect nicht in tote Sockets rennt.
-            if time.ticks_diff(current_time, last_wlan_check) > WLAN_CHECK_INTERVAL_MS:
-                last_wlan_check = current_time
-                try:
-                    _wlan = network.WLAN(network.STA_IF)
-                    if not _wlan.isconnected():
-                        print("WLAN getrennt - reconnect zu", env.WIFI_SSID)
-                        mqtt_connected = False
-                        try:
-                            _wlan.disconnect()
-                        except Exception:
-                            pass
-                        try:
-                            _wlan.active(True)
-                            _wlan.connect(env.WIFI_SSID, env.WIFI_PASSWORD)
-                        except Exception as e:
-                            print("WLAN reconnect Fehler:", e)
-                        # Modem-Sleep nach Reconnect wieder hart auf NONE
-                        try:
-                            esp.sleep_type(esp.SLEEP_NONE)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print("WLAN-Check Fehler:", e)
-
-            # Stale-Watchdog: wenn der Loop laeuft, aber 5 min lang kein MQTT-Publish
-            # mehr durchgegangen ist, sind WLAN/MQTT/Heap so kaputt, dass nur ein
-            # harter Reboot hilft. Greift wenn WLAN-Reconnect + mqtt_check_connection
-            # alleine die Verbindung nicht mehr zurueckholen koennen (z.B. OOM).
-            if last_successful_publish_ticks != 0 and time.ticks_diff(current_time, last_successful_publish_ticks) > PUBLISH_STALE_MS:
-                stale_ms = time.ticks_diff(current_time, last_successful_publish_ticks)
-                print("Stale-Watchdog: kein Publish seit %d ms - machine.reset()" % stale_ms)
-                try:
-                    with open("_reset_info.txt", "w") as _f:
-                        _f.write("stale-publish %dms heap=%d\n" % (stale_ms, gc.mem_free()))
-                except Exception:
-                    pass
-                try:
-                    rel1.off(); rel2.off()
-                except Exception:
-                    pass
-                time.sleep(1)  # Log/Relay-Aus durchlassen
-                machine.reset()
-
-            # Self-Echo-Watchdog (L2): faengt den 'silent publish' Fall ab den
-            # der reine Stale-Watchdog nicht sieht (QoS=0 publish() returnt success
-            # auch bei TCP CLOSE_WAIT / WLAN-Modem-Stuck).
-            # Loesung: ESP publisht alle 60s einen Token, broker liefert ihn an
-            # uns selbst zurueck via Subscribe. 120s kein Echo -> machine.reset().
-            if mqtt_connected:
-                if time.ticks_diff(current_time, last_ping_sent_ticks) > ECHO_INTERVAL_MS:
-                    try:
-                        last_ping_sent_token = current_time & 0x3FFFFFFF or 1  # nie 0
-                        mqtt.publish(b"tele/solar/PING_ECHO", str(last_ping_sent_token).encode())
-                        last_ping_sent_ticks = current_time
-                        # Grace bei erstem Ping: last_echo_seen_ticks auf jetzt setzen
-                        if last_echo_seen_ticks == 0:
-                            last_echo_seen_ticks = current_time
-                    except Exception as e:
-                        print("Echo-Publish Fehler:", e)
-                # Timeout-Check (nur wenn schon mal gepingt wurde)
-                if last_echo_seen_ticks != 0 and time.ticks_diff(current_time, last_echo_seen_ticks) > ECHO_TIMEOUT_MS:
-                    elapsed = time.ticks_diff(current_time, last_echo_seen_ticks)
-                    print("Echo-Watchdog: %d ms ohne Roundtrip - machine.reset()" % elapsed)
-                    try:
-                        with open("_reset_info.txt", "w") as _f:
-                            _f.write("echo-timeout %dms heap=%d\n" % (elapsed, gc.mem_free()))
-                    except Exception:
-                        pass
-                    try:
-                        rel1.off(); rel2.off()
-                    except Exception:
-                        pass
-                    time.sleep(1)
-                    machine.reset()
-
-            # Periodischer Hard-Reboot (L3): alle 6h sicheres Reset, killt
-            # akkumulierte Memory-Fragmentation und stille Driver-Stalls
-            # die selbst L1+L2 ueberleben koennten. Pragmatisch & garantiert.
-            if boot_ticks != 0 and time.ticks_diff(current_time, boot_ticks) > SCHEDULED_REBOOT_MS:
-                uptime_ms = time.ticks_diff(current_time, boot_ticks)
-                print("Scheduled-Reboot: %d ms uptime erreicht - machine.reset()" % uptime_ms)
-                try:
-                    with open("_reset_info.txt", "w") as _f:
-                        _f.write("scheduled-6h %dms heap=%d\n" % (uptime_ms, gc.mem_free()))
-                except Exception:
-                    pass
-                try:
-                    rel1.off(); rel2.off()
-                except Exception:
-                    pass
-                time.sleep(1)
-                machine.reset()
+            # Check for web requests (non-blocking check)
+            handle_web_request()
 
             # MQTT-Verbindung prüfen
             mqtt_check_connection()
+
+            # Connectivity-Watchdog (ueber HW-WDT hinaus, erkennt Netzwerk-Stalls)
+            health_check()
 
             # Zeit alle 24 Stunden neu synchronisieren
             if time.ticks_diff(current_time, last_time_sync) > 86400000:  # 24h in ms
@@ -891,22 +1052,26 @@ def loop():
                     print("Sensor error:", e)
                     system_status['last_error'] = f"Sensor error: {str(e)}"
             
-            # Recalculate angle every 10 minutes (Emergency override hat Vorrang)
+            # Recalculate angle every 10 minutes (Emergency override hat Vorrang,
+            # danach Tracking-Aktiv-Fenster - ausserhalb bleibt das Panel flach)
             if time.ticks_diff(current_time, last_angle_calc) > 600000:
                 angle = calculate_optimal_angle()
                 if emergency_mode:
                     target = env.MIN_ANGLE
-                elif is_night():
+                elif not is_tracking_active():
                     target = env.MIN_ANGLE
                 else:
                     target = angle
-                print("Neues Ziel: {:.1f}° (Sonne: {:.1f}°, Emergency={}) - {}".format(
-                    target, angle, emergency_mode, get_formatted_time()
+                start_h, end_h = tracking_window()
+                print("Neues Ziel: {:.1f}° (Sonne: {:.1f}°, Emergency={}, Tracking-Fenster {}-{}) - {}".format(
+                    target, angle, emergency_mode,
+                    _fmt_hours_hhmm(start_h), _fmt_hours_hhmm(end_h),
+                    get_formatted_time()
                 ))
                 last_angle_calc = current_time
 
                 # Debug-Nachricht via MQTT
-                mqtt_publish_debug(f"Angle recalculated: Sun={angle:.1f}° Target={target:.1f}°")
+                mqtt_publish_debug(f"Angle recalculated: Sun={angle:.1f}° Target={target:.1f}° Tracking={is_tracking_active()}")
             
             # MQTT-Daten alle 30 Sekunden senden
             if time.ticks_diff(current_time, last_mqtt_publish) > mqtt_publish_interval:
@@ -1010,18 +1175,9 @@ def loop():
 def init():
     global sensor, rel1, rel2, angle, target, wdt
     global udp_keepalive, udp_keepalive_gw
-    global last_successful_publish_ticks, boot_ticks
 
     print("Initialisierung...")
     gc.collect()
-    # Stale-Watchdog: Grace-Window startet ab init(). 5 Minuten ohne
-    # ersten Publish nach Boot -> Reboot.
-    last_successful_publish_ticks = time.ticks_ms()
-    # Scheduled-Reboot (L3): boot_ticks markiert Boot-Zeitpunkt fuer 6h-Timer.
-    boot_ticks = time.ticks_ms()
-
-    # Kalibrierung aus /calib.json laden (ueberschreibt env.SENSOR_OFFSET/_SIGN)
-    load_calibration()
 
     # Hardware Setup
     try:
@@ -1117,17 +1273,23 @@ def init():
     
     # MQTT-Verbindung aufbauen
     mqtt_connect()
-
+    
+    # Webserver starten
+    if not start_web():
+        return False
+    
     # Initial calculations (Emergency-Flag wird ggf. gleich danach vom
     # ersten check_msg gesetzt - retained-Message vom Broker)
     angle = calculate_optimal_angle()
     if emergency_mode:
         target = env.MIN_ANGLE
-    elif is_night():
+    elif not is_tracking_active():
         target = env.MIN_ANGLE
     else:
         target = angle
-    print("Ziel: {:.1f}° (Sonne: {:.1f}°)".format(target, angle))
+    start_h, end_h = tracking_window()
+    print("Ziel: {:.1f}° (Sonne: {:.1f}°, Tracking-Fenster {}-{})".format(
+        target, angle, _fmt_hours_hhmm(start_h), _fmt_hours_hhmm(end_h)))
 
     # Hardware-Watchdog erst nach erfolgreichem Init aktivieren.
     # ESP8266: Timeout fix ~3s, nicht konfigurierbar. Wird in loop() gefuettert.
