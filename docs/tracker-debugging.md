@@ -17,6 +17,8 @@ Der Tracker läuft im Feld nicht direkt aus der lesbaren Python-Datei, sondern a
 - `src/boot.py` – Start- und Boot-Logik
 - `src/main.py` – Loader, der `solar_main.mpy` lädt
 
+Die wichtigste Referenz für zukünftige Änderungen ist dabei die aktuelle Quelle in [src/solar_main.py](../src/solar_main.py) zusammen mit [src/env.example.py](../src/env.example.py). Diese Dateien bilden die Basis für den aktuellen Tracker-Stand im Repo.
+
 > Für die öffentliche Doku sollten die Werte aus `env.py` nur ohne sensible Zugangsdaten beschrieben werden. WLAN-, MQTT- und WebREPL-Credentials bleiben lokal und werden nicht im GitHub-Repo veröffentlicht.
 
 ## Was die aktive Quellbasis leistet

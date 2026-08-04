@@ -106,10 +106,10 @@ Der ESP fährt das Panel sofort auf `MIN_ANGLE` (Dachneigung, flach) und ignorie
 ```
 followmysun/
 ├── README.md                  # diese Datei
-├── src/                       # MicroPython-Code fuer ESP12F
-│   ├── boot.py
+├── src/                       # wichtigste Quellbasis des Trackers
+│   ├── boot.py                # Start- und Boot-Logik
 │   ├── main.py                # Loader fuer solar_main.mpy
-│   ├── solar_main.py          # Hauptlogik (Astro, MQTT, Web, Motor)
+│   ├── solar_main.py          # Hauptlogik (Astro, MQTT, Motor, Debug-Logik)
 │   ├── mpu6050.py             # I2C-Treiber MPU-6050
 │   ├── env.example.py         # Konfigurations-Template
 │   └── webrepl_cli.py         # Datei-Upload via WebREPL
