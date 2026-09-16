@@ -23,6 +23,7 @@ layout: default
 - [Software-Architektur](docs/software.html)
 - [Tracker-Debugging und Quellbasis](docs/tracker-debugging.html) — aktuelle Laufzeit-Variante, Quellbasis und Debug-Checkliste
 - [Hardware-Migration ESP12F → Olimex ESP32-EVB-EA](docs/hardware-migration-esp32-evb.html) — Umbau für WLAN-schwache Standorte, externe Antenne, korrekter 12 V-Split
+- [3D-Druck-Gehäuse Olimex ESP32-EVB-EA](docs/housing-esp32-evb.html) — Überkopfmontage im Schuppen, sechs Aktuator-Klemmen, Micro-USB und OpenSCAD-Quelldateien
 - [Wiring-Übersicht ESP32-EVB](docs/wiring-esp32-evb.html) — alle vier Schaltbilder auf einer Seite, als Werkbank-Referenz
 - [Source-Code auf GitHub](https://github.com/icepaule/followmysun)
 
@@ -67,6 +68,14 @@ Alle Werte werden per MQTT an einen Broker geschickt – damit baut sich in Home
     </td>
   </tr>
 </table>
+
+## Neues Controller-Gehäuse für Olimex ESP32-EVB-EA
+
+<img src="docs/img/housing-esp32-evb/preview_v0.3.jpg" alt="3D-Druck-Gehäuse für Olimex ESP32-EVB-EA Rev.L" style="max-width:100%;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.2);" />
+
+Für die ESP32-Migration ist ein eigenes **parametrisches v0.3-Gehäuse** für die Überkopfmontage unter dem Schuppendach hinzugekommen. Zugänglich bleiben die sechs Aktuator-Schraubklemmen, Micro-USB, PWR1, UEXT/Dupont, WLAN-Antenne und RST1; CAN wird nicht benötigt und bleibt geschlossen.
+
+→ [Gehäuse, Explosionsansicht, Maße und Druckanleitung](docs/housing-esp32-evb.html)
 
 ## Schnellstart
 
