@@ -72,6 +72,15 @@ Detaillierte Anleitung: **[docs/installation.md](docs/installation.md)**
 > inkl. Mermaid-Diagrammen für IST- und SOLL-Verkabelung sowie dem korrekten
 > 12 V-Split über einen Mini-360-Buck (das neue Board ist strikt 5 V!).
 
+### 3D-Druck-Gehäuse für den Olimex-Controller
+
+![Olimex ESP32-EVB-EA Rev.L Gehäuse v0.3](docs/img/housing-esp32-evb/preview_v0.3.jpg)
+
+Für die Überkopfmontage des neuen Controllers **im Schuppen unter dem Dach** gibt es jetzt ein eigenes parametrisches Gehäuse in **v0.3**. Es bietet Zugang zu den sechs Aktuator-Schraubklemmen, Micro-USB, PWR1, UEXT/Dupont, externer WLAN-Antenne und RST1; der nicht benötigte CAN-Anschluss bleibt geschlossen.
+
+- **[Gehäuse-Dokumentation](docs/housing-esp32-evb.md)** – Maße, Anschlussöffnungen, Explosionsansicht, Druckhinweise und Fit-Test
+- **[OpenSCAD-Quelle + Build-Script](hardware/enclosure/olimex-esp32-evb-ea-v0.3/)** – erzeugt Base, Lid, Reset-Button, Fit-Test und ZIP reproduzierbar
+
 ## MQTT-Topics für Home Assistant
 
 | Topic | Richtung | Beispiel | Beschreibung |
@@ -103,24 +112,23 @@ Der ESP fährt das Panel sofort auf `MIN_ANGLE` (Dachneigung, flach) und ignorie
 
 ## Repo-Struktur
 
-```
+```text
 followmysun/
-├── README.md                  # diese Datei
-├── src/                       # wichtigste Quellbasis des Trackers
-│   ├── boot.py                # Start- und Boot-Logik
-│   ├── main.py                # Loader fuer solar_main.mpy
-│   ├── solar_main.py          # Hauptlogik (Astro, MQTT, Motor, Debug-Logik)
-│   ├── mpu6050.py             # I2C-Treiber MPU-6050
-│   ├── env.example.py         # Konfigurations-Template
-│   └── webrepl_cli.py         # Datei-Upload via WebREPL
+├── README.md
+├── src/                       # Tracker-Firmware
 ├── docs/                      # Detail-Dokumentation
 │   ├── hardware.md
 │   ├── installation.md
 │   ├── mqtt.md
 │   ├── calibration.md
-│   ├── tracker-debugging.md  # aktuelle Quellbasis und Debug-Checkliste
-│   └── img/                   # Fotos vom realen Aufbau
-└── _config.yml                # Jekyll Konfiguration (GitHub Pages)
+│   ├── tracker-debugging.md
+│   ├── hardware-migration-esp32-evb.md
+│   ├── housing-esp32-evb.md   # 3D-Druck-Gehäuse Olimex v0.3
+│   └── img/
+├── hardware/
+│   └── enclosure/
+│       └── olimex-esp32-evb-ea-v0.3/  # SCAD, Build, Rev-L-Koordinaten, QA
+└── _config.yml
 ```
 
 ## Tech-Stack
