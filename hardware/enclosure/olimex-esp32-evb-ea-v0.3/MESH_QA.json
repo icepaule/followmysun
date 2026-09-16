@@ -1,0 +1,30 @@
+[
+  {
+    "file": "base_v0.3.stl",
+    "watertight": true,
+    "components": 1,
+    "faces": 5580,
+    "bounds_mm": [[-13.0, 0.0, 0.0], [107.0, 92.0, 27.4]]
+  },
+  {
+    "file": "lid_v0.3.stl",
+    "watertight": true,
+    "components": 1,
+    "faces": 1768,
+    "bounds_mm": [[0.0, 0.0, 0.0], [94.0, 92.0, 28.0]]
+  },
+  {
+    "file": "rst_button_v0.3.stl",
+    "watertight": true,
+    "components": 1,
+    "faces": 636,
+    "bounds_mm": [[-4.0, -4.0, 0.0], [4.0, 4.0, 13.4]]
+  },
+  {
+    "file": "fit_test_v0.3.stl",
+    "watertight": true,
+    "components": 1,
+    "faces": 632,
+    "bounds_mm": [[0.0, 0.0, 0.0], [154.0, 38.0, 3.0]]
+  }
+]
